@@ -27,17 +27,17 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "extra": {
-      "eas": {
-        "projectId": "b112c383-1993-4944-93ae-6a2882ff8c0c"
-      }
-    },
-    "owner": "pavanrao",
     "runtimeVersion": {
       "policy": "appVersion"
     },
+    "extra": {
+      "eas": {
+        "projectId": "8b0a5173-83d9-4796-81ea-3fc29e2546d3"
+      }
+    },
+    "owner": "pavan.m",
     "updates": {
-      "url": "https://u.expo.dev/b112c383-1993-4944-93ae-6a2882ff8c0c"
+      "url": "https://u.expo.dev/8b0a5173-83d9-4796-81ea-3fc29e2546d3"
     }
   }
 }

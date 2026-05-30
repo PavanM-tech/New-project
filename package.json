@@ -3,16 +3,16 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
-    "expo": "~56.0.8",
-    "expo-camera": "~56.0.7",
-    "expo-status-bar": "~56.0.4",
-    "expo-updates": "~56.0.17",
-    "react": "19.2.3",
-    "react-native": "0.85.3"
+    "expo": "^54.0.0",
+    "expo-camera": "~17.0.10",
+    "expo-status-bar": "~3.0.9",
+    "expo-updates": "~29.0.18",
+    "react": "19.1.0",
+    "react-native": "0.81.5"
   },
   "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
+    "@types/react": "~19.1.10",
+    "typescript": "~5.9.2"
   },
   "scripts": {
     "start": "expo start",
