@@ -37,6 +37,7 @@ AGENTS.md
 astra-ar-prototype/
 
 # local env files
+.env
 .env*.local
 
 # typescript
