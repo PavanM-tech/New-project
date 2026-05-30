@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Platform,
   Pressable,
   SafeAreaView,
@@ -60,8 +61,10 @@ export default function App() {
   const soundRef = useRef<Audio.Sound | null>(null);
   const stopVoiceCaptureRef = useRef<() => Promise<void>>(async () => undefined);
   const silenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasHeardSpeechRef = useRef(false);
   const isStoppingRef = useRef(false);
+  const isAutoStartingRef = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = Audio.usePermissions();
   const [cameraReady, setCameraReady] = useState(false);
@@ -78,6 +81,7 @@ export default function App() {
   const [isPanelOpen, setIsPanelOpen] = useState(true);
   const [isExamplesOpen, setIsExamplesOpen] = useState(false);
   const [recordingMillis, setRecordingMillis] = useState(0);
+  const [appState, setAppState] = useState(AppState.currentState);
 
   const canStartListening = useMemo(
     () =>
@@ -115,10 +119,19 @@ export default function App() {
   useEffect(() => {
     return () => {
       clearSilenceTimer(silenceTimeoutRef);
+      clearSilenceTimer(restartTimeoutRef);
       void stopSoundPlayback(soundRef);
       if (recordingRef.current) {
         void recordingRef.current.stopAndUnloadAsync().catch(() => undefined);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', setAppState);
+
+    return () => {
+      subscription.remove();
     };
   }, []);
 
@@ -202,7 +215,7 @@ export default function App() {
       const message =
         error instanceof Error ? error.message : 'Ved could not answer that voice request.';
       setErrorMessage(message);
-      setStatusLine('Voice request failed');
+      setStatusLine('Listening will resume');
       setIsSpeaking(false);
     } finally {
       isStoppingRef.current = false;
@@ -242,6 +255,7 @@ export default function App() {
     }
 
     try {
+      isAutoStartingRef.current = true;
       setErrorMessage(null);
       setHeardPrompt('Listening for your question...');
       setStatusLine('Listening');
@@ -314,8 +328,63 @@ export default function App() {
       setErrorMessage(message);
       setStatusLine('Mic error');
       setIsRecording(false);
+    } finally {
+      isAutoStartingRef.current = false;
     }
   }, [canStartListening, micPermission, requestMicPermission]);
+
+  useEffect(() => {
+    if (!cameraPermission?.granted || !cameraReady || appState !== 'active') {
+      return;
+    }
+
+    if (micPermission && !micPermission.granted && micPermission.canAskAgain) {
+      void requestMicPermission();
+    }
+  }, [
+    appState,
+    cameraPermission?.granted,
+    cameraReady,
+    micPermission,
+    requestMicPermission,
+  ]);
+
+  useEffect(() => {
+    if (
+      appState !== 'active' ||
+      !cameraPermission?.granted ||
+      !micPermission?.granted ||
+      !cameraReady ||
+      !cameraRef.current ||
+      isBusy ||
+      isSpeaking ||
+      isRecording ||
+      isAutoStartingRef.current
+    ) {
+      clearSilenceTimer(restartTimeoutRef);
+      return;
+    }
+
+    if (restartTimeoutRef.current) {
+      return;
+    }
+
+    restartTimeoutRef.current = setTimeout(() => {
+      restartTimeoutRef.current = null;
+      void startVoiceCapture();
+    }, 500);
+
+    return () => clearSilenceTimer(restartTimeoutRef);
+  }, [
+    appState,
+    cameraPermission?.granted,
+    micPermission?.granted,
+    cameraReady,
+    isBusy,
+    isRecording,
+    isSpeaking,
+    startVoiceCapture,
+  ]);
 
   if (!cameraPermission) {
     return (
@@ -339,6 +408,19 @@ export default function App() {
           void requestCameraPermission();
         }}
         title="Camera permission required"
+      />
+    );
+  }
+
+  if (micPermission && !micPermission.granted && !micPermission.canAskAgain) {
+    return (
+      <CenteredState
+        actionLabel="Enable Microphone"
+        description="Ved needs microphone access for always-listening voice mode. Please enable the microphone in app settings and reopen the app."
+        onPress={() => {
+          void requestMicPermission();
+        }}
+        title="Microphone permission required"
       />
     );
   }
@@ -421,30 +503,15 @@ export default function App() {
               {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
             </View>
 
-            <View style={styles.controlsRow}>
-              <Pressable
-                disabled={!canStartListening}
-                onPress={() => {
-                  void startVoiceCapture();
-                }}
-                style={[
-                  styles.voiceButton,
-                  styles.primaryVoiceButton,
-                  !canStartListening ? styles.disabledButton : null,
-                  isRecording ? styles.activeVoiceButton : null,
-                ]}
-              >
-                <Text style={styles.primaryVoiceButtonText}>
-                  {isRecording ? 'Listening for silence...' : 'Talk to Ved'}
-                </Text>
-              </Pressable>
-            </View>
-
             <View style={styles.metaRow}>
               <Text style={styles.metaText}>
                 {isRecording
-                  ? `Recording ${formatDuration(recordingMillis)}. Stop speaking to send.`
-                  : 'Ved replies in Gemini voice only.'}
+                  ? `Listening ${formatDuration(recordingMillis)}. Stop speaking to send.`
+                  : isSpeaking
+                    ? 'Ved is speaking back.'
+                    : isBusy
+                      ? 'Ved is processing your request.'
+                      : 'Ved is always listening while this app is open.'}
               </Text>
               <Pressable
                 onPress={() => setIsExamplesOpen((current) => !current)}
@@ -831,8 +898,8 @@ function CenteredState({ actionLabel, description, onPress, title }: CenteredSta
       <StatusBar style="light" />
       <Text style={styles.centeredTitle}>{title}</Text>
       <Text style={styles.centeredDescription}>{description}</Text>
-      <Pressable onPress={onPress} style={[styles.voiceButton, styles.primaryVoiceButton]}>
-        <Text style={styles.primaryVoiceButtonText}>{actionLabel}</Text>
+      <Pressable onPress={onPress} style={styles.permissionButton}>
+        <Text style={styles.permissionButtonText}>{actionLabel}</Text>
       </Pressable>
     </View>
   );
@@ -949,11 +1016,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  controlsRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 14,
-  },
   disabledButton: {
     opacity: 0.45,
   },
@@ -1043,10 +1105,17 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  primaryVoiceButton: {
+  permissionButton: {
+    alignItems: 'center',
     backgroundColor: '#7CE7FF',
+    borderRadius: 18,
+    justifyContent: 'center',
+    marginTop: 18,
+    minHeight: 54,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
   },
-  primaryVoiceButtonText: {
+  permissionButtonText: {
     color: '#08202A',
     fontSize: 15,
     fontWeight: '800',
@@ -1054,16 +1123,6 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     paddingBottom: 14,
-  },
-  secondaryVoiceButton: {
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
-    borderWidth: 1,
-  },
-  secondaryVoiceButtonText: {
-    color: '#F2F7FF',
-    fontSize: 15,
-    fontWeight: '700',
   },
   sideActions: {
     alignItems: 'flex-end',
@@ -1105,7 +1164,6 @@ const styles = StyleSheet.create({
   voiceButton: {
     alignItems: 'center',
     borderRadius: 18,
-    flex: 1,
     justifyContent: 'center',
     minHeight: 54,
     paddingHorizontal: 16,
