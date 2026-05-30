@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
+import { Buffer } from 'buffer';
 
 type Annotation = {
   color: string;
@@ -36,6 +37,10 @@ const ANALYSIS_MODEL = 'gemini-2.5-flash';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 const TTS_VOICE = 'Kore';
 const MAX_ANNOTATIONS = 5;
+const AUTO_STOP_SILENCE_MS = 1200;
+const MIN_RECORDING_MS = 900;
+const SPEECH_METERING_THRESHOLD = -38;
+const MAX_RECORDING_MS = 12000;
 const VOICE_EXAMPLES = [
   'Hey Ved, what is this?',
   'Hey Ved, explain the most important thing in front of me.',
@@ -53,12 +58,16 @@ export default function App() {
   const cameraRef = useRef<CameraView | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const stopVoiceCaptureRef = useRef<() => Promise<void>>(async () => undefined);
+  const silenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasHeardSpeechRef = useRef(false);
+  const isStoppingRef = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = Audio.usePermissions();
   const [cameraReady, setCameraReady] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [sceneSummary, setSceneSummary] = useState(
-    'Tap the mic, say "Hey Ved..." and Ved will answer in voice while updating the on-screen markers.',
+    'Tap once, say "Hey Ved..." and pause when you are done. Ved will auto-send your request and answer in voice.',
   );
   const [heardPrompt, setHeardPrompt] = useState('Try saying: "Hey Ved, what is this?"');
   const [statusLine, setStatusLine] = useState('Ready');
@@ -105,6 +114,7 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      clearSilenceTimer(silenceTimeoutRef);
       void stopSoundPlayback(soundRef);
       if (recordingRef.current) {
         void recordingRef.current.stopAndUnloadAsync().catch(() => undefined);
@@ -112,79 +122,14 @@ export default function App() {
     };
   }, []);
 
-  const startVoiceCapture = useCallback(async () => {
-    if (!API_KEY) {
-      Alert.alert(
-        'Gemini key missing',
-        'Add EXPO_PUBLIC_GEMINI_API_KEY to your environment before running the app.',
-      );
-      return;
-    }
-
-    if (!cameraRef.current || !canStartListening) {
-      return;
-    }
-
-    const permissionResponse = micPermission?.granted
-      ? micPermission
-      : await requestMicPermission();
-
-    if (!permissionResponse.granted) {
-      Alert.alert(
-        'Microphone permission required',
-        'Ved needs microphone access so you can ask questions out loud.',
-      );
-      return;
-    }
-
-    try {
-      setErrorMessage(null);
-      setHeardPrompt('Listening for your question...');
-      setStatusLine('Listening');
-      setRecordingMillis(0);
-      setIsPanelOpen(true);
-      setIsExamplesOpen(false);
-      await stopSoundPlayback(soundRef);
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        playThroughEarpieceAndroid: false,
-      });
-
-      const recording = new Audio.Recording();
-      recording.setOnRecordingStatusUpdate((status) => {
-        if ('durationMillis' in status && typeof status.durationMillis === 'number') {
-          setRecordingMillis(status.durationMillis);
-        }
-      });
-      recording.setProgressUpdateInterval(120);
-      await recording.prepareToRecordAsync(getRecordingOptions());
-      await recording.startAsync();
-
-      recordingRef.current = recording;
-      setIsRecording(true);
-    } catch (error) {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        playThroughEarpieceAndroid: false,
-      }).catch(() => undefined);
-
-      const message =
-        error instanceof Error ? error.message : 'Recording could not be started.';
-      setErrorMessage(message);
-      setStatusLine('Mic error');
-      setIsRecording(false);
-    }
-  }, [canStartListening, micPermission, requestMicPermission]);
-
   const stopVoiceCapture = useCallback(async () => {
-    if (!recordingRef.current || !cameraRef.current) {
+    if (!recordingRef.current || !cameraRef.current || isStoppingRef.current) {
       return;
     }
 
     try {
+      isStoppingRef.current = true;
+      clearSilenceTimer(silenceTimeoutRef);
       setIsRecording(false);
       setIsBusy(true);
       setErrorMessage(null);
@@ -260,10 +205,117 @@ export default function App() {
       setStatusLine('Voice request failed');
       setIsSpeaking(false);
     } finally {
+      isStoppingRef.current = false;
+      hasHeardSpeechRef.current = false;
       setIsBusy(false);
       setRecordingMillis(0);
     }
   }, [normalizeAnnotations]);
+
+  useEffect(() => {
+    stopVoiceCaptureRef.current = stopVoiceCapture;
+  }, [stopVoiceCapture]);
+
+  const startVoiceCapture = useCallback(async () => {
+    if (!API_KEY) {
+      Alert.alert(
+        'Gemini key missing',
+        'Add EXPO_PUBLIC_GEMINI_API_KEY to your environment before running the app.',
+      );
+      return;
+    }
+
+    if (!cameraRef.current || !canStartListening) {
+      return;
+    }
+
+    const permissionResponse = micPermission?.granted
+      ? micPermission
+      : await requestMicPermission();
+
+    if (!permissionResponse.granted) {
+      Alert.alert(
+        'Microphone permission required',
+        'Ved needs microphone access so you can ask questions out loud.',
+      );
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      setHeardPrompt('Listening for your question...');
+      setStatusLine('Listening');
+      setRecordingMillis(0);
+      setIsPanelOpen(true);
+      setIsExamplesOpen(false);
+      hasHeardSpeechRef.current = false;
+      isStoppingRef.current = false;
+      clearSilenceTimer(silenceTimeoutRef);
+      await stopSoundPlayback(soundRef);
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      const recording = new Audio.Recording();
+      recording.setOnRecordingStatusUpdate((status) => {
+        if ('durationMillis' in status && typeof status.durationMillis === 'number') {
+          setRecordingMillis(status.durationMillis);
+
+          const metering =
+            'metering' in status && typeof status.metering === 'number'
+              ? status.metering
+              : null;
+
+          if (metering !== null && metering > SPEECH_METERING_THRESHOLD) {
+            hasHeardSpeechRef.current = true;
+            clearSilenceTimer(silenceTimeoutRef);
+          }
+
+          if (
+            hasHeardSpeechRef.current &&
+            metering !== null &&
+            metering <= SPEECH_METERING_THRESHOLD &&
+            status.durationMillis > MIN_RECORDING_MS &&
+            !silenceTimeoutRef.current &&
+            !isStoppingRef.current
+          ) {
+            silenceTimeoutRef.current = setTimeout(() => {
+              silenceTimeoutRef.current = null;
+              void stopVoiceCaptureRef.current();
+            }, AUTO_STOP_SILENCE_MS);
+          }
+
+          if (
+            status.durationMillis >= MAX_RECORDING_MS &&
+            !isStoppingRef.current
+          ) {
+            void stopVoiceCaptureRef.current();
+          }
+        }
+      });
+      recording.setProgressUpdateInterval(120);
+      await recording.prepareToRecordAsync(getRecordingOptions());
+      await recording.startAsync();
+
+      recordingRef.current = recording;
+      setIsRecording(true);
+    } catch (error) {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+      }).catch(() => undefined);
+
+      const message =
+        error instanceof Error ? error.message : 'Recording could not be started.';
+      setErrorMessage(message);
+      setStatusLine('Mic error');
+      setIsRecording(false);
+    }
+  }, [canStartListening, micPermission, requestMicPermission]);
 
   if (!cameraPermission) {
     return (
@@ -383,29 +435,15 @@ export default function App() {
                 ]}
               >
                 <Text style={styles.primaryVoiceButtonText}>
-                  {isRecording ? 'Listening...' : 'Start talking'}
+                  {isRecording ? 'Listening for silence...' : 'Talk to Ved'}
                 </Text>
-              </Pressable>
-
-              <Pressable
-                disabled={!isRecording}
-                onPress={() => {
-                  void stopVoiceCapture();
-                }}
-                style={[
-                  styles.voiceButton,
-                  styles.secondaryVoiceButton,
-                  !isRecording ? styles.disabledButton : null,
-                ]}
-              >
-                <Text style={styles.secondaryVoiceButtonText}>Stop and ask</Text>
               </Pressable>
             </View>
 
             <View style={styles.metaRow}>
               <Text style={styles.metaText}>
                 {isRecording
-                  ? `Recording ${formatDuration(recordingMillis)}`
+                  ? `Recording ${formatDuration(recordingMillis)}. Stop speaking to send.`
                   : 'Ved replies in Gemini voice only.'}
               </Text>
               <Pressable
@@ -578,8 +616,9 @@ async function speakWithGemini({
     throw new Error('Gemini did not return audio output.');
   }
 
+  const wavBase64 = pcmToWavBase64(audioBase64, 24000, 1, 16);
   const fileUri = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory}ved-response-${Date.now()}.wav`;
-  await FileSystem.writeAsStringAsync(fileUri, audioBase64, {
+  await FileSystem.writeAsStringAsync(fileUri, wavBase64, {
     encoding: FileSystem.EncodingType.Base64,
   });
 
@@ -614,6 +653,17 @@ async function stopSoundPlayback(soundRef: React.MutableRefObject<Audio.Sound | 
   const sound = soundRef.current;
   soundRef.current = null;
   await sound.unloadAsync().catch(() => undefined);
+}
+
+function clearSilenceTimer(
+  silenceTimeoutRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>,
+) {
+  if (!silenceTimeoutRef.current) {
+    return;
+  }
+
+  clearTimeout(silenceTimeoutRef.current);
+  silenceTimeoutRef.current = null;
 }
 
 function getAudioMimeType() {
@@ -676,6 +726,50 @@ function getRecordingOptions(): Audio.RecordingOptions {
     },
     default: Audio.RecordingOptionsPresets.HIGH_QUALITY,
   }) as Audio.RecordingOptions;
+}
+
+function pcmToWavBase64(
+  pcmBase64: string,
+  sampleRate: number,
+  channels: number,
+  bitsPerSample: number,
+) {
+  const pcmBuffer = Buffer.from(pcmBase64, 'base64');
+  const wavHeader = createWavHeader(
+    pcmBuffer.length,
+    sampleRate,
+    channels,
+    bitsPerSample,
+  );
+
+  return Buffer.concat([wavHeader, pcmBuffer]).toString('base64');
+}
+
+function createWavHeader(
+  dataLength: number,
+  sampleRate: number,
+  channels: number,
+  bitsPerSample: number,
+) {
+  const header = Buffer.alloc(44);
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataLength, 40);
+
+  return header;
 }
 
 function parseGeminiJson(text: string): VoiceSceneResponse {
