@@ -8,7 +8,8 @@
     "userInterfaceStyle": "light",
     "ios": {
       "infoPlist": {
-        "NSCameraUsageDescription": "This prototype uses the camera to capture live frames and send them to Gemini for scene annotations."
+        "NSCameraUsageDescription": "This prototype uses the camera to capture live frames and send them to Gemini for scene annotations.",
+        "NSMicrophoneUsageDescription": "This prototype uses the microphone so you can ask Ved questions out loud."
       },
       "supportsTablet": true
     },
@@ -20,7 +21,8 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "permissions": [
-        "CAMERA"
+        "CAMERA",
+        "RECORD_AUDIO"
       ],
       "predictiveBackGestureEnabled": false
     },

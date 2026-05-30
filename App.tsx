@@ -4,14 +4,15 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Platform,
   Pressable,
   SafeAreaView,
-  ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
+import { Audio } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy';
 
 type Annotation = {
   color: string;
@@ -23,19 +24,22 @@ type Annotation = {
   y: number;
 };
 
-type GeminiResponse = {
+type VoiceSceneResponse = {
   annotations?: Array<Partial<Annotation>>;
+  answerText?: string;
   sceneSummary?: string;
+  spokenPrompt?: string;
 };
 
 const API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-const MODEL = 'gemini-2.5-flash';
-const LIVE_ANALYZE_INTERVAL_MS = 6000;
+const ANALYSIS_MODEL = 'gemini-2.5-flash';
+const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+const TTS_VOICE = 'Kore';
 const MAX_ANNOTATIONS = 5;
-const PRESET_PROMPTS = [
-  'Find the most important objects in view.',
-  'Point out anything that looks like a control, button, or switch.',
-  'Highlight things I might want to explain to a user.',
+const VOICE_EXAMPLES = [
+  'Hey Ved, what is this?',
+  'Hey Ved, explain the most important thing in front of me.',
+  'Hey Ved, point out any switches or controls you can see.',
 ];
 const COLOR_MAP: Record<string, string> = {
   amber: '#F4B942',
@@ -47,24 +51,38 @@ const COLOR_MAP: Record<string, string> = {
 
 export default function App() {
   const cameraRef = useRef<CameraView | null>(null);
-  const [permission, requestPermission] = useCameraPermissions();
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [micPermission, requestMicPermission] = Audio.usePermissions();
   const [cameraReady, setCameraReady] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
-  const [question, setQuestion] = useState(PRESET_PROMPTS[0]);
   const [sceneSummary, setSceneSummary] = useState(
-    'Use the camera, then ask Gemini to mark the most important objects in view.',
+    'Tap the mic, say "Hey Ved..." and Ved will answer in voice while updating the on-screen markers.',
   );
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [liveMode, setLiveMode] = useState(false);
-  const [lastAnalyzedAt, setLastAnalyzedAt] = useState<string | null>(null);
+  const [heardPrompt, setHeardPrompt] = useState('Try saying: "Hey Ved, what is this?"');
+  const [statusLine, setStatusLine] = useState('Ready');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isPanelOpen, setIsPanelOpen] = useState(true);
+  const [isExamplesOpen, setIsExamplesOpen] = useState(false);
+  const [recordingMillis, setRecordingMillis] = useState(0);
 
-  const canAnalyze = useMemo(
-    () => Boolean(permission?.granted && cameraReady && cameraRef.current && !isAnalyzing),
-    [cameraReady, isAnalyzing, permission?.granted],
+  const canStartListening = useMemo(
+    () =>
+      Boolean(
+        cameraPermission?.granted &&
+          cameraReady &&
+          cameraRef.current &&
+          !isBusy &&
+          !isRecording,
+      ),
+    [cameraPermission?.granted, cameraReady, isBusy, isRecording],
   );
 
-  const normalizeAnnotations = useCallback((response: GeminiResponse): Annotation[] => {
+  const normalizeAnnotations = useCallback((response: VoiceSceneResponse): Annotation[] => {
     const rawAnnotations = Array.isArray(response.annotations) ? response.annotations : [];
 
     return rawAnnotations.slice(0, MAX_ANNOTATIONS).map((item, index) => {
@@ -75,14 +93,26 @@ export default function App() {
         confidence: clampNumber(item.confidence, 0.25, 0, 1),
         id: `${Date.now()}-${index}`,
         label: sanitizeLabel(item.label, index),
-        reason: typeof item.reason === 'string' && item.reason.trim() ? item.reason.trim() : 'Detected by Gemini.',
+        reason:
+          typeof item.reason === 'string' && item.reason.trim()
+            ? item.reason.trim()
+            : 'Detected by Ved.',
         x: clampNumber(item.x, 0.5, 0.05, 0.95),
         y: clampNumber(item.y, 0.5, 0.08, 0.9),
       };
     });
   }, []);
 
-  const analyzeScene = useCallback(async () => {
+  useEffect(() => {
+    return () => {
+      void stopSoundPlayback(soundRef);
+      if (recordingRef.current) {
+        void recordingRef.current.stopAndUnloadAsync().catch(() => undefined);
+      }
+    };
+  }, []);
+
+  const startVoiceCapture = useCallback(async () => {
     if (!API_KEY) {
       Alert.alert(
         'Gemini key missing',
@@ -91,81 +121,170 @@ export default function App() {
       return;
     }
 
-    if (!cameraRef.current || !canAnalyze) {
+    if (!cameraRef.current || !canStartListening) {
+      return;
+    }
+
+    const permissionResponse = micPermission?.granted
+      ? micPermission
+      : await requestMicPermission();
+
+    if (!permissionResponse.granted) {
+      Alert.alert(
+        'Microphone permission required',
+        'Ved needs microphone access so you can ask questions out loud.',
+      );
       return;
     }
 
     try {
-      setIsAnalyzing(true);
       setErrorMessage(null);
+      setHeardPrompt('Listening for your question...');
+      setStatusLine('Listening');
+      setRecordingMillis(0);
+      setIsPanelOpen(true);
+      setIsExamplesOpen(false);
+      await stopSoundPlayback(soundRef);
 
-      const photo = await cameraRef.current.takePictureAsync({
-        base64: true,
-        imageType: 'jpg',
-        quality: 0.35,
-        skipProcessing: true,
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
       });
+
+      const recording = new Audio.Recording();
+      recording.setOnRecordingStatusUpdate((status) => {
+        if ('durationMillis' in status && typeof status.durationMillis === 'number') {
+          setRecordingMillis(status.durationMillis);
+        }
+      });
+      recording.setProgressUpdateInterval(120);
+      await recording.prepareToRecordAsync(getRecordingOptions());
+      await recording.startAsync();
+
+      recordingRef.current = recording;
+      setIsRecording(true);
+    } catch (error) {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+      }).catch(() => undefined);
+
+      const message =
+        error instanceof Error ? error.message : 'Recording could not be started.';
+      setErrorMessage(message);
+      setStatusLine('Mic error');
+      setIsRecording(false);
+    }
+  }, [canStartListening, micPermission, requestMicPermission]);
+
+  const stopVoiceCapture = useCallback(async () => {
+    if (!recordingRef.current || !cameraRef.current) {
+      return;
+    }
+
+    try {
+      setIsRecording(false);
+      setIsBusy(true);
+      setErrorMessage(null);
+      setStatusLine('Thinking');
+
+      const recording = recordingRef.current;
+      recordingRef.current = null;
+
+      await recording.stopAndUnloadAsync();
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      const recordingUri = recording.getURI();
+      if (!recordingUri) {
+        throw new Error('The recorded audio could not be read.');
+      }
+
+      const [audioBase64, photo] = await Promise.all([
+        FileSystem.readAsStringAsync(recordingUri, {
+          encoding: FileSystem.EncodingType.Base64,
+        }),
+        cameraRef.current.takePictureAsync({
+          base64: true,
+          quality: 0.35,
+          skipProcessing: true,
+        }),
+      ]);
 
       if (!photo.base64) {
         throw new Error('Camera capture did not include base64 image data.');
       }
 
-      const geminiResult = await requestSceneAnnotations({
-        apiKey: API_KEY,
+      const voiceResult = await requestVoiceSceneTurn({
+        apiKey: API_KEY ?? '',
+        audioBase64,
+        audioMimeType: getAudioMimeType(),
         imageBase64: photo.base64,
-        prompt: question.trim() || PRESET_PROMPTS[0],
       });
 
-      const parsedAnnotations = normalizeAnnotations(geminiResult);
+      const parsedAnnotations = normalizeAnnotations(voiceResult);
+      const resolvedAnswer =
+        voiceResult.answerText?.trim() ||
+        voiceResult.sceneSummary?.trim() ||
+        'I can see the scene, but I need a clearer question to answer well.';
+
       setAnnotations(parsedAnnotations);
-      setSceneSummary(
-        geminiResult.sceneSummary?.trim() ||
-          'Gemini did not return a scene summary, but the overlay has been updated.',
+      setHeardPrompt(
+        stripWakePhrase(voiceResult.spokenPrompt?.trim() || 'I heard your question, but not clearly.'),
       );
-      setLastAnalyzedAt(new Date().toLocaleTimeString());
+      setSceneSummary(
+        voiceResult.sceneSummary?.trim() ||
+          'Ved updated the markers and answered out loud.',
+      );
+      setStatusLine('Speaking');
+
+      await speakWithGemini({
+        apiKey: API_KEY ?? '',
+        soundRef,
+        text: resolvedAnswer,
+        onStart: () => setIsSpeaking(true),
+        onDone: () => {
+          setIsSpeaking(false);
+          setStatusLine('Ready');
+        },
+      });
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'The scene could not be analyzed.';
+        error instanceof Error ? error.message : 'Ved could not answer that voice request.';
       setErrorMessage(message);
+      setStatusLine('Voice request failed');
+      setIsSpeaking(false);
     } finally {
-      setIsAnalyzing(false);
+      setIsBusy(false);
+      setRecordingMillis(0);
     }
-  }, [canAnalyze, normalizeAnnotations, question]);
+  }, [normalizeAnnotations]);
 
-  useEffect(() => {
-    if (!liveMode) {
-      return;
-    }
-
-    const intervalId = setInterval(() => {
-      if (!isAnalyzing) {
-        void analyzeScene();
-      }
-    }, LIVE_ANALYZE_INTERVAL_MS);
-
-    return () => clearInterval(intervalId);
-  }, [analyzeScene, isAnalyzing, liveMode]);
-
-  if (!permission) {
+  if (!cameraPermission) {
     return (
       <CenteredState
         actionLabel="Request Camera Access"
         description="Preparing the camera permission flow..."
         onPress={() => {
-          void requestPermission();
+          void requestCameraPermission();
         }}
         title="Camera setup"
       />
     );
   }
 
-  if (!permission.granted) {
+  if (!cameraPermission.granted) {
     return (
       <CenteredState
         actionLabel="Allow Camera"
-        description="This prototype needs live camera access to capture frames and send them to Gemini for annotations."
+        description="This prototype needs live camera access so Ved can see what you are asking about."
         onPress={() => {
-          void requestPermission();
+          void requestCameraPermission();
         }}
         title="Camera permission required"
       />
@@ -210,97 +329,135 @@ export default function App() {
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.topBar}>
           <View style={styles.badge}>
-            <Text style={styles.badgeText}>Astra-style overlay prototype</Text>
+            <Text style={styles.badgeText}>Ved voice mode</Text>
           </View>
           <View style={styles.badge}>
-            <Text style={styles.badgeText}>{liveMode ? 'Live scan on' : 'Live scan off'}</Text>
+            <Text style={styles.badgeText}>
+              {isRecording ? 'Listening' : isSpeaking ? 'Speaking' : isBusy ? 'Thinking' : 'Ready'}
+            </Text>
           </View>
         </View>
 
-        <View style={styles.bottomPanel}>
-          <Text style={styles.panelTitle}>Live scene annotations</Text>
-          <Text style={styles.panelSummary}>{sceneSummary}</Text>
-          {lastAnalyzedAt ? (
-            <Text style={styles.metaText}>Last analyzed at {lastAnalyzedAt}</Text>
-          ) : null}
-          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
-
-          <TextInput
-            multiline
-            onChangeText={setQuestion}
-            placeholder="Tell Gemini what to highlight..."
-            placeholderTextColor="#8A9AB0"
-            style={styles.promptInput}
-            value={question}
-          />
-
-          <ScrollView
-            contentContainerStyle={styles.presetRow}
-            horizontal
-            showsHorizontalScrollIndicator={false}
+        <View style={styles.sideActions}>
+          <Pressable
+            onPress={() => setIsPanelOpen((current) => !current)}
+            style={styles.panelToggle}
           >
-            {PRESET_PROMPTS.map((preset) => (
-              <Pressable key={preset} onPress={() => setQuestion(preset)} style={styles.presetChip}>
-                <Text style={styles.presetText}>{preset}</Text>
-              </Pressable>
-            ))}
-          </ScrollView>
-
-          <View style={styles.buttonRow}>
-            <ActionButton
-              disabled={!canAnalyze}
-              label={isAnalyzing ? 'Analyzing...' : 'Analyze frame'}
-              onPress={() => {
-                void analyzeScene();
-              }}
-              primary
-            />
-            <ActionButton
-              label={liveMode ? 'Stop live scan' : 'Start live scan'}
-              onPress={() => setLiveMode((current) => !current)}
-            />
-          </View>
-
-          <View style={styles.buttonRow}>
-            <ActionButton
-              label="Clear labels"
-              onPress={() => {
-                setAnnotations([]);
-                setSceneSummary('Overlay cleared. Capture another frame when you are ready.');
-              }}
-            />
-          </View>
-
-          <Text style={styles.footerNote}>
-            This Expo MVP uses screen-space overlays. For true world-anchored AR labels, the next step is
-            a native dev client with ARCore or ARKit.
-          </Text>
+            <Text style={styles.panelToggleText}>{isPanelOpen ? 'Hide panel' : 'Show panel'}</Text>
+          </Pressable>
         </View>
+
+        {isPanelOpen ? (
+          <View style={styles.bottomPanel}>
+            <View style={styles.panelHeader}>
+              <View>
+                <Text style={styles.panelTitle}>Ask Ved out loud</Text>
+                <Text style={styles.panelSummary}>{sceneSummary}</Text>
+              </View>
+              <Pressable
+                onPress={() => setIsPanelOpen(false)}
+                style={styles.closeButton}
+              >
+                <Text style={styles.closeButtonText}>Close</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.statusCard}>
+              <Text style={styles.statusLabel}>Heard</Text>
+              <Text style={styles.statusValue}>{heardPrompt}</Text>
+              <Text style={styles.statusMeta}>{statusLine}</Text>
+              {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+            </View>
+
+            <View style={styles.controlsRow}>
+              <Pressable
+                disabled={!canStartListening}
+                onPress={() => {
+                  void startVoiceCapture();
+                }}
+                style={[
+                  styles.voiceButton,
+                  styles.primaryVoiceButton,
+                  !canStartListening ? styles.disabledButton : null,
+                  isRecording ? styles.activeVoiceButton : null,
+                ]}
+              >
+                <Text style={styles.primaryVoiceButtonText}>
+                  {isRecording ? 'Listening...' : 'Start talking'}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                disabled={!isRecording}
+                onPress={() => {
+                  void stopVoiceCapture();
+                }}
+                style={[
+                  styles.voiceButton,
+                  styles.secondaryVoiceButton,
+                  !isRecording ? styles.disabledButton : null,
+                ]}
+              >
+                <Text style={styles.secondaryVoiceButtonText}>Stop and ask</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.metaRow}>
+              <Text style={styles.metaText}>
+                {isRecording
+                  ? `Recording ${formatDuration(recordingMillis)}`
+                  : 'Ved replies in Gemini voice only.'}
+              </Text>
+              <Pressable
+                onPress={() => setIsExamplesOpen((current) => !current)}
+                style={styles.examplesToggle}
+              >
+                <Text style={styles.examplesToggleText}>
+                  {isExamplesOpen ? 'Hide examples' : 'Show examples'}
+                </Text>
+              </Pressable>
+            </View>
+
+            {isExamplesOpen ? (
+              <View style={styles.examplesPanel}>
+                {VOICE_EXAMPLES.map((example) => (
+                  <Text key={example} style={styles.exampleLine}>
+                    {example}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+          </View>
+        ) : null}
       </SafeAreaView>
 
-      {isAnalyzing ? (
+      {isBusy ? (
         <View style={styles.loadingOverlay}>
           <ActivityIndicator color="#FFFFFF" size="large" />
-          <Text style={styles.loadingText}>Gemini is reading the current frame...</Text>
+          <Text style={styles.loadingText}>
+            {isSpeaking ? 'Ved is talking back...' : 'Ved is looking and listening...'}
+          </Text>
         </View>
       ) : null}
     </View>
   );
 }
 
-type RequestSceneAnnotationsArgs = {
+type RequestVoiceSceneTurnArgs = {
   apiKey: string;
+  audioBase64: string;
+  audioMimeType: string;
   imageBase64: string;
-  prompt: string;
 };
 
-async function requestSceneAnnotations({
+async function requestVoiceSceneTurn({
   apiKey,
+  audioBase64,
+  audioMimeType,
   imageBase64,
-  prompt,
-}: RequestSceneAnnotationsArgs): Promise<GeminiResponse> {
+}: RequestVoiceSceneTurnArgs): Promise<VoiceSceneResponse> {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${ANALYSIS_MODEL}:generateContent?key=${apiKey}`,
     {
       body: JSON.stringify({
         contents: [
@@ -308,14 +465,15 @@ async function requestSceneAnnotations({
             parts: [
               {
                 text:
-                  'You are helping drive an augmented-reality annotation overlay on a phone camera preview. ' +
-                  'Return only JSON with keys sceneSummary and annotations. ' +
-                  'sceneSummary must be a short plain-English sentence. ' +
-                  'annotations must be an array with up to 5 items. ' +
-                  'Each item must include label, reason, x, y, confidence, and color. ' +
-                  'x and y must be normalized values between 0 and 1 representing where a label should be placed on screen. ' +
-                  'Choose one of these colors: cyan, amber, coral, mint, lime. ' +
-                  `User request: ${prompt}`,
+                  'You are Ved, a camera assistant. The user has sent a photo and a short voice question. ' +
+                  'Transcribe the spoken question, ignore a leading wake phrase like "Hey Ved" if present, ' +
+                  'answer in one or two short spoken sentences, and return only JSON. ' +
+                  'Use keys spokenPrompt, answerText, sceneSummary, and annotations. ' +
+                  'sceneSummary should be one concise sentence. ' +
+                  'annotations should be an array of up to 5 objects with label, reason, x, y, confidence, and color. ' +
+                  'x and y must be normalized values between 0 and 1. ' +
+                  'color must be one of cyan, amber, coral, mint, lime. ' +
+                  'Keep answerText natural and conversational for spoken playback.',
               },
               {
                 inlineData: {
@@ -323,12 +481,18 @@ async function requestSceneAnnotations({
                   mimeType: 'image/jpeg',
                 },
               },
+              {
+                inlineData: {
+                  data: audioBase64,
+                  mimeType: audioMimeType,
+                },
+              },
             ],
           },
         ],
         generationConfig: {
           responseMimeType: 'application/json',
-          temperature: 0.4,
+          temperature: 0.35,
         },
       }),
       headers: {
@@ -340,7 +504,7 @@ async function requestSceneAnnotations({
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Gemini request failed: ${response.status} ${errorText}`);
+    throw new Error(`Gemini analysis failed: ${response.status} ${errorText}`);
   }
 
   const payload = await response.json();
@@ -349,15 +513,174 @@ async function requestSceneAnnotations({
     .join('');
 
   if (!text) {
-    throw new Error('Gemini returned an empty response.');
+    throw new Error('Gemini did not return a voice-scene response.');
   }
 
   return parseGeminiJson(text);
 }
 
-function parseGeminiJson(text: string): GeminiResponse {
+type SpeakWithGeminiArgs = {
+  apiKey: string;
+  onDone: () => void;
+  onStart: () => void;
+  soundRef: React.MutableRefObject<Audio.Sound | null>;
+  text: string;
+};
+
+async function speakWithGemini({
+  apiKey,
+  onDone,
+  onStart,
+  soundRef,
+  text,
+}: SpeakWithGeminiArgs) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${apiKey}`,
+    {
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: `[friendly, helpful] ${text}`,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            languageCode: 'en-IN',
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: TTS_VOICE,
+              },
+            },
+          },
+        },
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini TTS failed: ${response.status} ${errorText}`);
+  }
+
+  const payload = await response.json();
+  const audioBase64 = payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+  if (!audioBase64) {
+    throw new Error('Gemini did not return audio output.');
+  }
+
+  const fileUri = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory}ved-response-${Date.now()}.wav`;
+  await FileSystem.writeAsStringAsync(fileUri, audioBase64, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  await stopSoundPlayback(soundRef);
+  await Audio.setAudioModeAsync({
+    allowsRecordingIOS: false,
+    playsInSilentModeIOS: true,
+    playThroughEarpieceAndroid: false,
+  });
+
+  const { sound } = await Audio.Sound.createAsync(
+    { uri: fileUri },
+    { shouldPlay: false, progressUpdateIntervalMillis: 200 },
+    (status) => {
+      if ('didJustFinish' in status && status.didJustFinish) {
+        onDone();
+        void stopSoundPlayback(soundRef);
+      }
+    },
+  );
+
+  soundRef.current = sound;
+  onStart();
+  await sound.playAsync();
+}
+
+async function stopSoundPlayback(soundRef: React.MutableRefObject<Audio.Sound | null>) {
+  if (!soundRef.current) {
+    return;
+  }
+
+  const sound = soundRef.current;
+  soundRef.current = null;
+  await sound.unloadAsync().catch(() => undefined);
+}
+
+function getAudioMimeType() {
+  return Platform.OS === 'ios' ? 'audio/wav' : 'audio/aac';
+}
+
+function getRecordingOptions(): Audio.RecordingOptions {
+  return Platform.select<Audio.RecordingOptions>({
+    android: {
+      android: {
+        extension: '.aac',
+        outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
+        audioEncoder: Audio.AndroidAudioEncoder.AAC,
+        sampleRate: 24000,
+        numberOfChannels: 1,
+        bitRate: 64000,
+      },
+      ios: {
+        extension: '.aac',
+        outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
+        audioQuality: Audio.IOSAudioQuality.HIGH,
+        sampleRate: 24000,
+        numberOfChannels: 1,
+        bitRate: 64000,
+        linearPCMBitDepth: 16,
+        linearPCMIsBigEndian: false,
+        linearPCMIsFloat: false,
+      },
+      web: {
+        mimeType: 'audio/webm',
+        bitsPerSecond: 64000,
+      },
+      isMeteringEnabled: true,
+    },
+    ios: {
+      android: {
+        extension: '.aac',
+        outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
+        audioEncoder: Audio.AndroidAudioEncoder.AAC,
+        sampleRate: 24000,
+        numberOfChannels: 1,
+        bitRate: 64000,
+      },
+      ios: {
+        extension: '.wav',
+        outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+        audioQuality: Audio.IOSAudioQuality.HIGH,
+        sampleRate: 24000,
+        numberOfChannels: 1,
+        bitRate: 768000,
+        linearPCMBitDepth: 16,
+        linearPCMIsBigEndian: false,
+        linearPCMIsFloat: false,
+      },
+      web: {
+        mimeType: 'audio/webm',
+        bitsPerSecond: 64000,
+      },
+      isMeteringEnabled: true,
+    },
+    default: Audio.RecordingOptionsPresets.HIGH_QUALITY,
+  }) as Audio.RecordingOptions;
+}
+
+function parseGeminiJson(text: string): VoiceSceneResponse {
   try {
-    return JSON.parse(text) as GeminiResponse;
+    return JSON.parse(text) as VoiceSceneResponse;
   } catch {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
 
@@ -365,7 +688,7 @@ function parseGeminiJson(text: string): GeminiResponse {
       throw new Error('Gemini response was not valid JSON.');
     }
 
-    return JSON.parse(jsonMatch[0]) as GeminiResponse;
+    return JSON.parse(jsonMatch[0]) as VoiceSceneResponse;
   }
 }
 
@@ -387,6 +710,20 @@ function sanitizeLabel(value: unknown, index: number) {
   return value.trim().slice(0, 42);
 }
 
+function stripWakePhrase(text: string) {
+  return text.replace(/^hey\s+ved[\s,.:;-]*/i, '').trim() || text;
+}
+
+function formatDuration(durationMillis: number) {
+  const totalSeconds = Math.max(0, Math.floor(durationMillis / 1000));
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, '0');
+  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+
+  return `${minutes}:${seconds}`;
+}
+
 type CenteredStateProps = {
   actionLabel: string;
   description: string;
@@ -400,45 +737,16 @@ function CenteredState({ actionLabel, description, onPress, title }: CenteredSta
       <StatusBar style="light" />
       <Text style={styles.centeredTitle}>{title}</Text>
       <Text style={styles.centeredDescription}>{description}</Text>
-      <Pressable onPress={onPress} style={[styles.actionButton, styles.primaryButton]}>
-        <Text style={styles.primaryButtonText}>{actionLabel}</Text>
+      <Pressable onPress={onPress} style={[styles.voiceButton, styles.primaryVoiceButton]}>
+        <Text style={styles.primaryVoiceButtonText}>{actionLabel}</Text>
       </Pressable>
     </View>
   );
 }
 
-type ActionButtonProps = {
-  disabled?: boolean;
-  label: string;
-  onPress: () => void;
-  primary?: boolean;
-};
-
-function ActionButton({ disabled, label, onPress, primary }: ActionButtonProps) {
-  return (
-    <Pressable
-      disabled={disabled}
-      onPress={onPress}
-      style={[
-        styles.actionButton,
-        primary ? styles.primaryButton : styles.secondaryButton,
-        disabled ? styles.disabledButton : null,
-      ]}
-    >
-      <Text style={primary ? styles.primaryButtonText : styles.secondaryButtonText}>{label}</Text>
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
-  actionButton: {
-    alignItems: 'center',
-    borderRadius: 18,
-    flex: 1,
-    justifyContent: 'center',
-    minHeight: 52,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+  activeVoiceButton: {
+    backgroundColor: '#5CFFF2',
   },
   annotationCard: {
     backgroundColor: 'rgba(12, 16, 27, 0.9)',
@@ -446,7 +754,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 1,
     marginTop: 8,
-    maxWidth: 180,
+    maxWidth: 184,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
@@ -505,7 +813,7 @@ const styles = StyleSheet.create({
   },
   bottomPanel: {
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(6, 10, 18, 0.82)',
+    backgroundColor: 'rgba(6, 10, 18, 0.78)',
     borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 28,
     borderWidth: 1,
@@ -514,11 +822,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 18,
     paddingTop: 18,
-  },
-  buttonRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 12,
   },
   centeredDescription: {
     color: '#AFC3DC',
@@ -541,20 +844,52 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     textAlign: 'center',
   },
+  closeButton: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  closeButtonText: {
+    color: '#EAF3FF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  controlsRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 14,
+  },
   disabledButton: {
-    opacity: 0.55,
+    opacity: 0.45,
   },
   errorText: {
     color: '#FFB7B3',
     fontSize: 13,
     lineHeight: 18,
-    marginTop: 8,
+    marginTop: 10,
   },
-  footerNote: {
-    color: '#93A7C3',
+  exampleLine: {
+    color: '#DCE8F8',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  examplesPanel: {
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 18,
+    gap: 8,
+    marginTop: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  examplesToggle: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  examplesToggleText: {
+    color: '#8EDCFF',
     fontSize: 12,
-    lineHeight: 18,
-    marginTop: 14,
+    fontWeight: '700',
   },
   loadingOverlay: {
     alignItems: 'center',
@@ -572,80 +907,114 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: 12,
   },
+  metaRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 12,
+  },
   metaText: {
     color: '#8AA0BC',
     fontSize: 12,
     fontWeight: '600',
-    marginTop: 6,
+  },
+  panelHeader: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
   },
   panelSummary: {
     color: '#D8E3F3',
     fontSize: 14,
     lineHeight: 20,
     marginTop: 8,
+    maxWidth: 260,
   },
   panelTitle: {
     color: '#F7FBFF',
     fontSize: 22,
     fontWeight: '800',
   },
-  presetChip: {
-    backgroundColor: 'rgba(117, 156, 255, 0.12)',
-    borderColor: 'rgba(117, 156, 255, 0.25)',
+  panelToggle: {
+    backgroundColor: 'rgba(6, 10, 18, 0.72)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 999,
     borderWidth: 1,
-    marginRight: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  presetRow: {
-    paddingVertical: 4,
-  },
-  presetText: {
-    color: '#DCE7FA',
+  panelToggleText: {
+    color: '#E7F3FF',
     fontSize: 12,
     fontWeight: '700',
   },
-  primaryButton: {
+  primaryVoiceButton: {
     backgroundColor: '#7CE7FF',
   },
-  primaryButtonText: {
+  primaryVoiceButtonText: {
     color: '#08202A',
     fontSize: 15,
     fontWeight: '800',
-  },
-  promptInput: {
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
-    borderRadius: 18,
-    borderWidth: 1,
-    color: '#F3F8FF',
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 14,
-    minHeight: 86,
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    textAlignVertical: 'top',
   },
   safeArea: {
     flex: 1,
     paddingBottom: 14,
   },
-  secondaryButton: {
+  secondaryVoiceButton: {
     backgroundColor: 'rgba(255, 255, 255, 0.08)',
     borderColor: 'rgba(255, 255, 255, 0.12)',
     borderWidth: 1,
   },
-  secondaryButtonText: {
+  secondaryVoiceButtonText: {
     color: '#F2F7FF',
     fontSize: 15,
     fontWeight: '700',
+  },
+  sideActions: {
+    alignItems: 'flex-end',
+    paddingHorizontal: 14,
+    paddingTop: 10,
+  },
+  statusCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 20,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  statusLabel: {
+    color: '#89A5C7',
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  statusMeta: {
+    color: '#8EDCFF',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 8,
+  },
+  statusValue: {
+    color: '#F4F8FF',
+    fontSize: 16,
+    fontWeight: '600',
+    lineHeight: 22,
+    marginTop: 8,
   },
   topBar: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     paddingHorizontal: 14,
     paddingTop: 10,
+  },
+  voiceButton: {
+    alignItems: 'center',
+    borderRadius: 18,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 54,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
   },
 });
