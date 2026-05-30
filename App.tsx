@@ -29,8 +29,17 @@ type Annotation = {
 type VoiceSceneResponse = {
   annotations?: Array<Partial<Annotation>>;
   answerText?: string;
+  followUpMode?: 'none' | 'show_notebook_math';
+  followUpPrompt?: string;
   sceneSummary?: string;
   spokenPrompt?: string;
+};
+
+type VisualFollowUpResponse = {
+  annotations?: Array<Partial<Annotation>>;
+  answerText?: string;
+  resolved?: boolean;
+  sceneSummary?: string;
 };
 
 const API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
@@ -42,6 +51,7 @@ const AUTO_STOP_SILENCE_MS = 1200;
 const MIN_RECORDING_MS = 900;
 const SPEECH_METERING_THRESHOLD = -38;
 const MAX_RECORDING_MS = 12000;
+const FOLLOW_UP_SCAN_INTERVAL_MS = 2400;
 const VOICE_EXAMPLES = [
   'Hey Ved, what is this?',
   'Hey Ved, explain the most important thing in front of me.',
@@ -62,6 +72,8 @@ export default function App() {
   const stopVoiceCaptureRef = useRef<() => Promise<void>>(async () => undefined);
   const silenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const visualScanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isVisualScanInFlightRef = useRef(false);
   const hasHeardSpeechRef = useRef(false);
   const isStoppingRef = useRef(false);
   const isAutoStartingRef = useRef(false);
@@ -70,7 +82,7 @@ export default function App() {
   const [cameraReady, setCameraReady] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [sceneSummary, setSceneSummary] = useState(
-    'Tap once, say "Hey Ved..." and pause when you are done. Ved will auto-send your request and answer in voice.',
+    'Ved is always listening while this app is open. Say "Hey Ved..." and pause when you are done.',
   );
   const [heardPrompt, setHeardPrompt] = useState('Try saying: "Hey Ved, what is this?"');
   const [statusLine, setStatusLine] = useState('Ready');
@@ -82,6 +94,8 @@ export default function App() {
   const [isExamplesOpen, setIsExamplesOpen] = useState(false);
   const [recordingMillis, setRecordingMillis] = useState(0);
   const [appState, setAppState] = useState(AppState.currentState);
+  const [pendingFollowUpMode, setPendingFollowUpMode] = useState<'show_notebook_math' | null>(null);
+  const [followUpPrompt, setFollowUpPrompt] = useState<string | null>(null);
 
   const canStartListening = useMemo(
     () =>
@@ -120,6 +134,7 @@ export default function App() {
     return () => {
       clearSilenceTimer(silenceTimeoutRef);
       clearSilenceTimer(restartTimeoutRef);
+      clearIntervalIfPresent(visualScanIntervalRef);
       void stopSoundPlayback(soundRef);
       if (recordingRef.current) {
         void recordingRef.current.stopAndUnloadAsync().catch(() => undefined);
@@ -186,6 +201,10 @@ export default function App() {
       });
 
       const parsedAnnotations = normalizeAnnotations(voiceResult);
+      const followUpMode =
+        voiceResult.followUpMode === 'show_notebook_math'
+          ? 'show_notebook_math'
+          : null;
       const resolvedAnswer =
         voiceResult.answerText?.trim() ||
         voiceResult.sceneSummary?.trim() ||
@@ -195,8 +214,16 @@ export default function App() {
       setHeardPrompt(
         stripWakePhrase(voiceResult.spokenPrompt?.trim() || 'I heard your question, but not clearly.'),
       );
+      setPendingFollowUpMode(followUpMode);
+      setFollowUpPrompt(
+        followUpMode
+          ? voiceResult.followUpPrompt?.trim() || 'Show me your notebook clearly so I can read the math.'
+          : null,
+      );
       setSceneSummary(
-        voiceResult.sceneSummary?.trim() ||
+        (followUpMode
+          ? voiceResult.followUpPrompt?.trim()
+          : voiceResult.sceneSummary?.trim()) ||
           'Ved updated the markers and answered out loud.',
       );
       setStatusLine('Speaking');
@@ -359,6 +386,7 @@ export default function App() {
       isBusy ||
       isSpeaking ||
       isRecording ||
+      pendingFollowUpMode !== null ||
       isAutoStartingRef.current
     ) {
       clearSilenceTimer(restartTimeoutRef);
@@ -383,7 +411,113 @@ export default function App() {
     isBusy,
     isRecording,
     isSpeaking,
+    pendingFollowUpMode,
     startVoiceCapture,
+  ]);
+
+  const runVisualFollowUpScan = useCallback(async () => {
+    if (
+      !pendingFollowUpMode ||
+      !cameraRef.current ||
+      isVisualScanInFlightRef.current ||
+      isBusy ||
+      isSpeaking ||
+      isRecording
+    ) {
+      return;
+    }
+
+    try {
+      isVisualScanInFlightRef.current = true;
+      setStatusLine('Looking for your notebook');
+
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true,
+        quality: 0.4,
+        skipProcessing: true,
+      });
+
+      if (!photo.base64) {
+        throw new Error('Camera capture did not include base64 image data.');
+      }
+
+      const followUpResult = await requestVisualFollowUp({
+        apiKey: API_KEY ?? '',
+        imageBase64: photo.base64,
+        mode: pendingFollowUpMode,
+      });
+
+      if (!followUpResult.resolved) {
+        setSceneSummary(
+          followUpPrompt ||
+            followUpResult.sceneSummary?.trim() ||
+            'Bring the notebook closer and keep it steady.',
+        );
+        return;
+      }
+
+      setAnnotations(normalizeAnnotations(followUpResult));
+      setPendingFollowUpMode(null);
+      setFollowUpPrompt(null);
+      setSceneSummary(
+        followUpResult.sceneSummary?.trim() ||
+          'Ved found the notebook and is explaining the math now.',
+      );
+      setHeardPrompt('Notebook detected');
+      setStatusLine('Speaking');
+
+      await speakWithGemini({
+        apiKey: API_KEY ?? '',
+        soundRef,
+        text:
+          followUpResult.answerText?.trim() ||
+          'I can see the notebook now, but I need a clearer frame to explain the math well.',
+        onStart: () => setIsSpeaking(true),
+        onDone: () => {
+          setIsSpeaking(false);
+          setStatusLine('Ready');
+        },
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Ved could not scan the notebook yet.';
+      setErrorMessage(message);
+      setStatusLine('Waiting for a clearer notebook view');
+    } finally {
+      isVisualScanInFlightRef.current = false;
+    }
+  }, [
+    followUpPrompt,
+    isBusy,
+    isRecording,
+    isSpeaking,
+    normalizeAnnotations,
+    pendingFollowUpMode,
+  ]);
+
+  useEffect(() => {
+    if (
+      !pendingFollowUpMode ||
+      appState !== 'active' ||
+      !cameraPermission?.granted ||
+      !cameraReady
+    ) {
+      clearIntervalIfPresent(visualScanIntervalRef);
+      return;
+    }
+
+    void runVisualFollowUpScan();
+    visualScanIntervalRef.current = setInterval(() => {
+      void runVisualFollowUpScan();
+    }, FOLLOW_UP_SCAN_INTERVAL_MS);
+
+    return () => clearIntervalIfPresent(visualScanIntervalRef);
+  }, [
+    appState,
+    cameraPermission?.granted,
+    cameraReady,
+    pendingFollowUpMode,
+    runVisualFollowUpScan,
   ]);
 
   if (!cameraPermission) {
@@ -501,12 +635,19 @@ export default function App() {
               <Text style={styles.statusValue}>{heardPrompt}</Text>
               <Text style={styles.statusMeta}>{statusLine}</Text>
               {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+              {pendingFollowUpMode ? (
+                <Text style={styles.followUpText}>
+                  Waiting for notebook math. Hold the page steady in front of the camera.
+                </Text>
+              ) : null}
             </View>
 
             <View style={styles.metaRow}>
               <Text style={styles.metaText}>
                 {isRecording
                   ? `Listening ${formatDuration(recordingMillis)}. Stop speaking to send.`
+                  : pendingFollowUpMode
+                    ? 'Ved is scanning the camera for your notebook and equations.'
                   : isSpeaking
                     ? 'Ved is speaking back.'
                     : isBusy
@@ -573,12 +714,14 @@ async function requestVoiceSceneTurn({
                   'You are Ved, a camera assistant. The user has sent a photo and a short voice question. ' +
                   'Transcribe the spoken question, ignore a leading wake phrase like "Hey Ved" if present, ' +
                   'answer in one or two short spoken sentences, and return only JSON. ' +
-                  'Use keys spokenPrompt, answerText, sceneSummary, and annotations. ' +
+                  'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, and annotations. ' +
                   'sceneSummary should be one concise sentence. ' +
                   'annotations should be an array of up to 5 objects with label, reason, x, y, confidence, and color. ' +
                   'x and y must be normalized values between 0 and 1. ' +
                   'color must be one of cyan, amber, coral, mint, lime. ' +
-                  'Keep answerText natural and conversational for spoken playback.',
+                  'Keep answerText natural and conversational for spoken playback. ' +
+                  'If the user asks to check a notebook, homework, calculation, equation, or math answer and the image does not clearly show readable math, set followUpMode to "show_notebook_math", set followUpPrompt to a short instruction asking them to show the notebook clearly, and keep answerText aligned with that request. ' +
+                  'If the math is visible and readable, set followUpMode to "none" and solve or explain it briefly.',
               },
               {
                 inlineData: {
@@ -622,6 +765,68 @@ async function requestVoiceSceneTurn({
   }
 
   return parseGeminiJson(text);
+}
+
+type RequestVisualFollowUpArgs = {
+  apiKey: string;
+  imageBase64: string;
+  mode: 'show_notebook_math';
+};
+
+async function requestVisualFollowUp({
+  apiKey,
+  imageBase64,
+  mode,
+}: RequestVisualFollowUpArgs): Promise<VisualFollowUpResponse> {
+  const prompt =
+    mode === 'show_notebook_math'
+      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, and annotations that point to the important lines or equations. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
+      : 'Return only JSON.';
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${ANALYSIS_MODEL}:generateContent?key=${apiKey}`,
+    {
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  data: imageBase64,
+                  mimeType: 'image/jpeg',
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+        },
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini visual follow-up failed: ${response.status} ${errorText}`);
+  }
+
+  const payload = await response.json();
+  const text = payload?.candidates?.[0]?.content?.parts
+    ?.map((part: { text?: string }) => part.text ?? '')
+    .join('');
+
+  if (!text) {
+    throw new Error('Gemini did not return a visual follow-up response.');
+  }
+
+  return parseGeminiJson(text) as VisualFollowUpResponse;
 }
 
 type SpeakWithGeminiArgs = {
@@ -731,6 +936,17 @@ function clearSilenceTimer(
 
   clearTimeout(silenceTimeoutRef.current);
   silenceTimeoutRef.current = null;
+}
+
+function clearIntervalIfPresent(
+  intervalRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>,
+) {
+  if (!intervalRef.current) {
+    return;
+  }
+
+  clearInterval(intervalRef.current);
+  intervalRef.current = null;
 }
 
 function getAudioMimeType() {
@@ -910,8 +1126,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#5CFFF2',
   },
   annotationCard: {
-    backgroundColor: 'rgba(12, 16, 27, 0.9)',
-    borderColor: 'rgba(255, 255, 255, 0.14)',
+    backgroundColor: 'rgba(12, 16, 27, 0.56)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 16,
     borderWidth: 1,
     marginTop: 8,
@@ -974,8 +1190,8 @@ const styles = StyleSheet.create({
   },
   bottomPanel: {
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(6, 10, 18, 0.78)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
+    backgroundColor: 'rgba(6, 10, 18, 0.56)',
+    borderColor: 'rgba(255, 255, 255, 0.1)',
     borderRadius: 28,
     borderWidth: 1,
     marginHorizontal: 14,
@@ -1031,7 +1247,7 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   examplesPanel: {
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
     borderRadius: 18,
     gap: 8,
     marginTop: 12,
@@ -1047,9 +1263,16 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  followUpText: {
+    color: '#95DFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 18,
+    marginTop: 10,
+  },
   loadingOverlay: {
     alignItems: 'center',
-    backgroundColor: 'rgba(3, 7, 12, 0.45)',
+    backgroundColor: 'rgba(3, 7, 12, 0.34)',
     bottom: 0,
     justifyContent: 'center',
     left: 0,
@@ -1130,7 +1353,7 @@ const styles = StyleSheet.create({
     paddingTop: 10,
   },
   statusCard: {
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
     borderRadius: 20,
     marginTop: 14,
     paddingHorizontal: 14,
