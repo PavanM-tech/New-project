@@ -11,6 +11,9 @@ type Annotation = {
   confidence: number;
   id: string;
   label: string;
+  lineHeight?: number;
+  lineWidth?: number;
+  placement?: 'left' | 'right' | 'top' | 'bottom';
   reason: string;
   x: number;
   y: number;
@@ -51,7 +54,7 @@ const API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
 const ANALYSIS_MODEL = 'gemini-2.5-flash';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 const TTS_VOICE = 'Kore';
-const MAX_ANNOTATIONS = 5;
+const MAX_ANNOTATIONS = 3;
 const AUTO_STOP_SILENCE_MS = 1200;
 const MIN_RECORDING_MS = 900;
 const SPEECH_METERING_THRESHOLD = -38;
@@ -120,6 +123,19 @@ export default function App() {
         confidence: clampNumber(item.confidence, 0.25, 0, 1),
         id: `${Date.now()}-${index}`,
         label: sanitizeLabel(item.label, index),
+        lineHeight: clampNumber(
+          'lineHeight' in item ? item.lineHeight : undefined,
+          44,
+          18,
+          120,
+        ),
+        lineWidth: clampNumber(
+          'lineWidth' in item ? item.lineWidth : undefined,
+          80,
+          36,
+          160,
+        ),
+        placement: normalizePlacement('placement' in item ? item.placement : undefined),
         reason:
           typeof item.reason === 'string' && item.reason.trim()
             ? item.reason.trim()
@@ -632,19 +648,26 @@ export default function App() {
             key={annotation.id}
             style={[
               styles.annotationWrap,
+              getAnnotationWrapStyle(annotation.placement),
               {
                 left: `${annotation.x * 100}%`,
                 top: `${annotation.y * 100}%`,
               },
             ]}
           >
-            <View style={[styles.annotationDot, { backgroundColor: annotation.color }]} />
-            <View style={styles.annotationCard}>
+            <View style={[styles.annotationAnchor, getAnnotationAnchorStyle(annotation.placement)]}>
+              <View style={[styles.annotationDot, { backgroundColor: annotation.color }]} />
+              <View
+                style={[
+                  styles.annotationLine,
+                  getAnnotationLineStyle(annotation.placement, annotation.lineWidth, annotation.lineHeight),
+                  { borderColor: `${annotation.color}88` },
+                ]}
+              />
+            </View>
+            <View style={[styles.annotationCard, getAnnotationCardStyle(annotation.placement)]}>
               <Text style={styles.annotationLabel}>{annotation.label}</Text>
               <Text style={styles.annotationReason}>{annotation.reason}</Text>
-              <Text style={styles.annotationConfidence}>
-                {Math.round(annotation.confidence * 100)}% confidence
-              </Text>
             </View>
           </View>
         ))}
@@ -738,9 +761,12 @@ async function requestVoiceSceneTurn({
                   'answer in one or two short spoken sentences, and return only JSON. ' +
                   'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, focusX, focusY, focusLabel, cameraZoom, and annotations. ' +
                   'sceneSummary should be one concise sentence. ' +
-                  'annotations should be an array of up to 5 objects with label, reason, x, y, confidence, and color. ' +
+                  'annotations should be an array of up to 3 objects with label, reason, x, y, color, placement, lineWidth, and lineHeight. ' +
                   'x and y must be normalized values between 0 and 1. ' +
                   'color must be one of cyan, amber, coral, mint, lime. ' +
+                  'placement must be one of left, right, top, or bottom and describes where the callout card should sit relative to the target point. ' +
+                  'Only annotate the specific region that answers the user question or shows the likely issue. Never annotate every visible object. ' +
+                  'If the user asks what is wrong, what is incorrect, what failed, or what to fix, annotate only the wrong or suspicious parts. ' +
                   'When a specific object, line, equation, or region is important, include focusX, focusY, a short focusLabel, and cameraZoom between 0 and 0.7 so the app can emphasize that region. ' +
                   'Keep answerText natural and conversational for spoken playback. ' +
                   'If the user asks to check a notebook, homework, calculation, equation, or math answer and the image does not clearly show readable math, set followUpMode to "show_notebook_math", set followUpPrompt to a short instruction asking them to show the notebook clearly, and keep answerText aligned with that request. ' +
@@ -803,7 +829,7 @@ async function requestVisualFollowUp({
 }: RequestVisualFollowUpArgs): Promise<VisualFollowUpResponse> {
   const prompt =
     mode === 'show_notebook_math'
-      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, focusX, focusY, focusLabel, cameraZoom, and annotations that point to the important lines or equations. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
+      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, focusX, focusY, focusLabel, cameraZoom, and annotations that point only to the wrong or most relevant lines or equations. Use at most 3 annotations. Each annotation should include label, reason, x, y, color, placement, lineWidth, and lineHeight. Use transparent callout-style placements like left, right, top, or bottom. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
       : 'Return only JSON.';
 
   const response = await fetch(
@@ -1110,6 +1136,91 @@ function sanitizeLabel(value: unknown, index: number) {
   return value.trim().slice(0, 42);
 }
 
+function normalizePlacement(value: unknown): Annotation['placement'] {
+  if (value === 'left' || value === 'right' || value === 'top' || value === 'bottom') {
+    return value;
+  }
+
+  return 'right';
+}
+
+function getAnnotationWrapStyle(placement: Annotation['placement']) {
+  switch (placement) {
+    case 'left':
+      return { marginLeft: -220, marginTop: -18 };
+    case 'top':
+      return { marginLeft: -96, marginTop: -144 };
+    case 'bottom':
+      return { marginLeft: -96, marginTop: 18 };
+    case 'right':
+    default:
+      return { marginLeft: 14, marginTop: -18 };
+  }
+}
+
+function getAnnotationAnchorStyle(placement: Annotation['placement']) {
+  if (placement === 'top' || placement === 'bottom') {
+    return {
+      alignItems: 'center' as const,
+      flexDirection: 'column' as const,
+    };
+  }
+
+  return {
+    alignItems: 'center' as const,
+    flexDirection: 'row' as const,
+  };
+}
+
+function getAnnotationLineStyle(
+  placement: Annotation['placement'],
+  lineWidth = 80,
+  lineHeight = 44,
+) {
+  switch (placement) {
+    case 'left':
+      return {
+        borderTopWidth: 2,
+        marginLeft: 0,
+        marginRight: 8,
+        width: lineWidth,
+      };
+    case 'top':
+      return {
+        borderLeftWidth: 2,
+        height: lineHeight,
+        marginBottom: 8,
+      };
+    case 'bottom':
+      return {
+        borderLeftWidth: 2,
+        height: lineHeight,
+        marginTop: 8,
+      };
+    case 'right':
+    default:
+      return {
+        borderTopWidth: 2,
+        marginLeft: 8,
+        width: lineWidth,
+      };
+  }
+}
+
+function getAnnotationCardStyle(placement: Annotation['placement']) {
+  switch (placement) {
+    case 'left':
+      return { alignSelf: 'flex-end' as const, marginRight: 28, marginTop: -12 };
+    case 'top':
+      return { alignSelf: 'center' as const, marginBottom: 8 };
+    case 'bottom':
+      return { alignSelf: 'center' as const, marginTop: 8 };
+    case 'right':
+    default:
+      return { marginLeft: 24, marginTop: -12 };
+  }
+}
+
 function stripWakePhrase(text: string) {
   return text.replace(/^hey\s+ved[\s,.:;-]*/i, '').trim() || text;
 }
@@ -1148,21 +1259,18 @@ const styles = StyleSheet.create({
   activeVoiceButton: {
     backgroundColor: '#5CFFF2',
   },
+  annotationAnchor: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
   annotationCard: {
-    backgroundColor: 'rgba(12, 16, 27, 0.56)',
+    backgroundColor: 'rgba(12, 16, 27, 0.42)',
     borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 16,
     borderWidth: 1,
-    marginTop: 8,
-    maxWidth: 184,
+    maxWidth: 210,
     paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  annotationConfidence: {
-    color: '#89A3C8',
-    fontSize: 11,
-    fontWeight: '600',
-    marginTop: 6,
+    paddingVertical: 9,
   },
   annotationDot: {
     borderColor: 'rgba(255, 255, 255, 0.65)',
@@ -1173,8 +1281,11 @@ const styles = StyleSheet.create({
   },
   annotationLabel: {
     color: '#F7FAFF',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '700',
+  },
+  annotationLine: {
+    opacity: 0.62,
   },
   annotationLayer: {
     bottom: 0,
@@ -1210,13 +1321,11 @@ const styles = StyleSheet.create({
   },
   annotationReason: {
     color: '#D5E1F2',
-    fontSize: 12,
-    lineHeight: 16,
+    fontSize: 11,
+    lineHeight: 15,
     marginTop: 4,
   },
   annotationWrap: {
-    marginLeft: -12,
-    marginTop: -12,
     position: 'absolute',
   },
   appShell: {
