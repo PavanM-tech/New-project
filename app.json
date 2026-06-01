@@ -7,6 +7,7 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
+      "bundleIdentifier": "com.pavanm.vedassistant",
       "infoPlist": {
         "NSCameraUsageDescription": "This prototype uses the camera to capture live frames and send them to Gemini for scene annotations.",
         "NSMicrophoneUsageDescription": "This prototype uses the microphone so you can ask Ved questions out loud."
@@ -14,6 +15,7 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.pavanm.vedassistant",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",

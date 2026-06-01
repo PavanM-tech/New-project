@@ -1,17 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  AppState,
-  Platform,
-  Pressable,
-  SafeAreaView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Alert, AppState, Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Buffer } from 'buffer';
@@ -26,11 +16,22 @@ type Annotation = {
   y: number;
 };
 
+type FocusGuide = {
+  label?: string;
+  x: number;
+  y: number;
+  zoom: number;
+};
+
 type VoiceSceneResponse = {
   annotations?: Array<Partial<Annotation>>;
   answerText?: string;
+  cameraZoom?: number;
+  focusLabel?: string;
   followUpMode?: 'none' | 'show_notebook_math';
   followUpPrompt?: string;
+  focusX?: number;
+  focusY?: number;
   sceneSummary?: string;
   spokenPrompt?: string;
 };
@@ -38,6 +39,10 @@ type VoiceSceneResponse = {
 type VisualFollowUpResponse = {
   annotations?: Array<Partial<Annotation>>;
   answerText?: string;
+  cameraZoom?: number;
+  focusLabel?: string;
+  focusX?: number;
+  focusY?: number;
   resolved?: boolean;
   sceneSummary?: string;
 };
@@ -52,11 +57,6 @@ const MIN_RECORDING_MS = 900;
 const SPEECH_METERING_THRESHOLD = -38;
 const MAX_RECORDING_MS = 12000;
 const FOLLOW_UP_SCAN_INTERVAL_MS = 2400;
-const VOICE_EXAMPLES = [
-  'Hey Ved, what is this?',
-  'Hey Ved, explain the most important thing in front of me.',
-  'Hey Ved, point out any switches or controls you can see.',
-];
 const COLOR_MAP: Record<string, string> = {
   amber: '#F4B942',
   coral: '#FF7A59',
@@ -80,22 +80,22 @@ export default function App() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = Audio.usePermissions();
   const [cameraReady, setCameraReady] = useState(false);
+  const [cameraZoom, setCameraZoom] = useState(0);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [sceneSummary, setSceneSummary] = useState(
     'Ved is always listening while this app is open. Say "Hey Ved..." and pause when you are done.',
   );
-  const [heardPrompt, setHeardPrompt] = useState('Try saying: "Hey Ved, what is this?"');
   const [statusLine, setStatusLine] = useState('Ready');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isPanelOpen, setIsPanelOpen] = useState(true);
-  const [isExamplesOpen, setIsExamplesOpen] = useState(false);
   const [recordingMillis, setRecordingMillis] = useState(0);
   const [appState, setAppState] = useState(AppState.currentState);
   const [pendingFollowUpMode, setPendingFollowUpMode] = useState<'show_notebook_math' | null>(null);
   const [followUpPrompt, setFollowUpPrompt] = useState<string | null>(null);
+  const [focusGuide, setFocusGuide] = useState<FocusGuide | null>(null);
 
   const canStartListening = useMemo(
     () =>
@@ -128,6 +128,40 @@ export default function App() {
         y: clampNumber(item.y, 0.5, 0.08, 0.9),
       };
     });
+  }, []);
+
+  const normalizeFocusGuide = useCallback((response: VoiceSceneResponse | VisualFollowUpResponse) => {
+    const x = clampNumber(
+      'focusX' in response ? response.focusX : undefined,
+      Number.NaN,
+      0.05,
+      0.95,
+    );
+    const y = clampNumber(
+      'focusY' in response ? response.focusY : undefined,
+      Number.NaN,
+      0.08,
+      0.9,
+    );
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return null;
+    }
+
+    return {
+      label:
+        'focusLabel' in response && typeof response.focusLabel === 'string'
+          ? response.focusLabel.trim()
+          : undefined,
+      x,
+      y,
+      zoom: clampNumber(
+        'cameraZoom' in response ? response.cameraZoom : undefined,
+        0.18,
+        0,
+        0.7,
+      ),
+    } satisfies FocusGuide;
   }, []);
 
   useEffect(() => {
@@ -205,21 +239,21 @@ export default function App() {
         voiceResult.followUpMode === 'show_notebook_math'
           ? 'show_notebook_math'
           : null;
+      const focus = normalizeFocusGuide(voiceResult);
       const resolvedAnswer =
         voiceResult.answerText?.trim() ||
         voiceResult.sceneSummary?.trim() ||
         'I can see the scene, but I need a clearer question to answer well.';
 
       setAnnotations(parsedAnnotations);
-      setHeardPrompt(
-        stripWakePhrase(voiceResult.spokenPrompt?.trim() || 'I heard your question, but not clearly.'),
-      );
       setPendingFollowUpMode(followUpMode);
       setFollowUpPrompt(
         followUpMode
           ? voiceResult.followUpPrompt?.trim() || 'Show me your notebook clearly so I can read the math.'
           : null,
       );
+      setFocusGuide(focus);
+      setCameraZoom(focus?.zoom ?? 0);
       setSceneSummary(
         (followUpMode
           ? voiceResult.followUpPrompt?.trim()
@@ -284,11 +318,9 @@ export default function App() {
     try {
       isAutoStartingRef.current = true;
       setErrorMessage(null);
-      setHeardPrompt('Listening for your question...');
       setStatusLine('Listening');
       setRecordingMillis(0);
       setIsPanelOpen(true);
-      setIsExamplesOpen(false);
       hasHeardSpeechRef.current = false;
       isStoppingRef.current = false;
       clearSilenceTimer(silenceTimeoutRef);
@@ -448,6 +480,8 @@ export default function App() {
       });
 
       if (!followUpResult.resolved) {
+        setFocusGuide(null);
+        setCameraZoom(0);
         setSceneSummary(
           followUpPrompt ||
             followUpResult.sceneSummary?.trim() ||
@@ -457,13 +491,15 @@ export default function App() {
       }
 
       setAnnotations(normalizeAnnotations(followUpResult));
+      const followUpFocus = normalizeFocusGuide(followUpResult);
       setPendingFollowUpMode(null);
       setFollowUpPrompt(null);
+      setFocusGuide(followUpFocus);
+      setCameraZoom(followUpFocus?.zoom ?? 0.12);
       setSceneSummary(
         followUpResult.sceneSummary?.trim() ||
           'Ved found the notebook and is explaining the math now.',
       );
-      setHeardPrompt('Notebook detected');
       setStatusLine('Speaking');
 
       await speakWithGemini({
@@ -491,6 +527,7 @@ export default function App() {
     isBusy,
     isRecording,
     isSpeaking,
+    normalizeFocusGuide,
     normalizeAnnotations,
     pendingFollowUpMode,
   ]);
@@ -568,9 +605,28 @@ export default function App() {
         facing="back"
         onCameraReady={() => setCameraReady(true)}
         style={StyleSheet.absoluteFill}
+        zoom={cameraZoom}
       />
 
       <View pointerEvents="none" style={styles.annotationLayer}>
+        {focusGuide ? (
+          <View
+            style={[
+              styles.focusGuide,
+              {
+                left: `${focusGuide.x * 100}%`,
+                top: `${focusGuide.y * 100}%`,
+              },
+            ]}
+          >
+            <View style={styles.focusGuideRing} />
+            {focusGuide.label ? (
+              <View style={styles.focusGuideLabelWrap}>
+                <Text style={styles.focusGuideLabel}>{focusGuide.label}</Text>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
         {annotations.map((annotation) => (
           <View
             key={annotation.id}
@@ -618,9 +674,14 @@ export default function App() {
         {isPanelOpen ? (
           <View style={styles.bottomPanel}>
             <View style={styles.panelHeader}>
-              <View>
-                <Text style={styles.panelTitle}>Ask Ved out loud</Text>
+              <View style={styles.panelCopy}>
                 <Text style={styles.panelSummary}>{sceneSummary}</Text>
+                {pendingFollowUpMode ? (
+                  <Text style={styles.followUpText}>
+                    Hold the notebook steady. Ved is scanning for readable math.
+                  </Text>
+                ) : null}
+                {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
               </View>
               <Pressable
                 onPress={() => setIsPanelOpen(false)}
@@ -628,18 +689,6 @@ export default function App() {
               >
                 <Text style={styles.closeButtonText}>Close</Text>
               </Pressable>
-            </View>
-
-            <View style={styles.statusCard}>
-              <Text style={styles.statusLabel}>Heard</Text>
-              <Text style={styles.statusValue}>{heardPrompt}</Text>
-              <Text style={styles.statusMeta}>{statusLine}</Text>
-              {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
-              {pendingFollowUpMode ? (
-                <Text style={styles.followUpText}>
-                  Waiting for notebook math. Hold the page steady in front of the camera.
-                </Text>
-              ) : null}
             </View>
 
             <View style={styles.metaRow}>
@@ -654,37 +703,10 @@ export default function App() {
                       ? 'Ved is processing your request.'
                       : 'Ved is always listening while this app is open.'}
               </Text>
-              <Pressable
-                onPress={() => setIsExamplesOpen((current) => !current)}
-                style={styles.examplesToggle}
-              >
-                <Text style={styles.examplesToggleText}>
-                  {isExamplesOpen ? 'Hide examples' : 'Show examples'}
-                </Text>
-              </Pressable>
             </View>
-
-            {isExamplesOpen ? (
-              <View style={styles.examplesPanel}>
-                {VOICE_EXAMPLES.map((example) => (
-                  <Text key={example} style={styles.exampleLine}>
-                    {example}
-                  </Text>
-                ))}
-              </View>
-            ) : null}
           </View>
         ) : null}
       </SafeAreaView>
-
-      {isBusy ? (
-        <View style={styles.loadingOverlay}>
-          <ActivityIndicator color="#FFFFFF" size="large" />
-          <Text style={styles.loadingText}>
-            {isSpeaking ? 'Ved is talking back...' : 'Ved is looking and listening...'}
-          </Text>
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -714,11 +736,12 @@ async function requestVoiceSceneTurn({
                   'You are Ved, a camera assistant. The user has sent a photo and a short voice question. ' +
                   'Transcribe the spoken question, ignore a leading wake phrase like "Hey Ved" if present, ' +
                   'answer in one or two short spoken sentences, and return only JSON. ' +
-                  'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, and annotations. ' +
+                  'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, focusX, focusY, focusLabel, cameraZoom, and annotations. ' +
                   'sceneSummary should be one concise sentence. ' +
                   'annotations should be an array of up to 5 objects with label, reason, x, y, confidence, and color. ' +
                   'x and y must be normalized values between 0 and 1. ' +
                   'color must be one of cyan, amber, coral, mint, lime. ' +
+                  'When a specific object, line, equation, or region is important, include focusX, focusY, a short focusLabel, and cameraZoom between 0 and 0.7 so the app can emphasize that region. ' +
                   'Keep answerText natural and conversational for spoken playback. ' +
                   'If the user asks to check a notebook, homework, calculation, equation, or math answer and the image does not clearly show readable math, set followUpMode to "show_notebook_math", set followUpPrompt to a short instruction asking them to show the notebook clearly, and keep answerText aligned with that request. ' +
                   'If the math is visible and readable, set followUpMode to "none" and solve or explain it briefly.',
@@ -780,7 +803,7 @@ async function requestVisualFollowUp({
 }: RequestVisualFollowUpArgs): Promise<VisualFollowUpResponse> {
   const prompt =
     mode === 'show_notebook_math'
-      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, and annotations that point to the important lines or equations. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
+      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, focusX, focusY, focusLabel, cameraZoom, and annotations that point to the important lines or equations. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
       : 'Return only JSON.';
 
   const response = await fetch(
@@ -1160,6 +1183,31 @@ const styles = StyleSheet.create({
     right: 0,
     top: 0,
   },
+  focusGuide: {
+    marginLeft: -34,
+    marginTop: -34,
+    position: 'absolute',
+  },
+  focusGuideLabel: {
+    color: '#F4FAFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  focusGuideLabelWrap: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(10, 18, 30, 0.52)',
+    borderRadius: 999,
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  focusGuideRing: {
+    borderColor: 'rgba(124, 231, 255, 0.95)',
+    borderRadius: 34,
+    borderWidth: 3,
+    height: 68,
+    width: 68,
+  },
   annotationReason: {
     color: '#D5E1F2',
     fontSize: 12,
@@ -1241,28 +1289,6 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginTop: 10,
   },
-  exampleLine: {
-    color: '#DCE8F8',
-    fontSize: 13,
-    lineHeight: 19,
-  },
-  examplesPanel: {
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
-    borderRadius: 18,
-    gap: 8,
-    marginTop: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-  },
-  examplesToggle: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  examplesToggleText: {
-    color: '#8EDCFF',
-    fontSize: 12,
-    fontWeight: '700',
-  },
   followUpText: {
     color: '#95DFFF',
     fontSize: 12,
@@ -1270,32 +1296,14 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginTop: 10,
   },
-  loadingOverlay: {
-    alignItems: 'center',
-    backgroundColor: 'rgba(3, 7, 12, 0.34)',
-    bottom: 0,
-    justifyContent: 'center',
-    left: 0,
-    position: 'absolute',
-    right: 0,
-    top: 0,
-  },
-  loadingText: {
-    color: '#F8FBFF',
-    fontSize: 14,
-    fontWeight: '700',
-    marginTop: 12,
-  },
   metaRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 12,
+    marginTop: 10,
   },
   metaText: {
     color: '#8AA0BC',
     fontSize: 12,
     fontWeight: '600',
+    lineHeight: 17,
   },
   panelHeader: {
     alignItems: 'flex-start',
@@ -1303,17 +1311,14 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: 12,
   },
+  panelCopy: {
+    flex: 1,
+  },
   panelSummary: {
     color: '#D8E3F3',
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 8,
+    fontSize: 13,
+    lineHeight: 18,
     maxWidth: 260,
-  },
-  panelTitle: {
-    color: '#F7FBFF',
-    fontSize: 22,
-    fontWeight: '800',
   },
   panelToggle: {
     backgroundColor: 'rgba(6, 10, 18, 0.72)',
@@ -1351,32 +1356,6 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     paddingHorizontal: 14,
     paddingTop: 10,
-  },
-  statusCard: {
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
-    borderRadius: 20,
-    marginTop: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-  },
-  statusLabel: {
-    color: '#89A5C7',
-    fontSize: 12,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-  },
-  statusMeta: {
-    color: '#8EDCFF',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 8,
-  },
-  statusValue: {
-    color: '#F4F8FF',
-    fontSize: 16,
-    fontWeight: '600',
-    lineHeight: 22,
-    marginTop: 8,
   },
   topBar: {
     flexDirection: 'row',
