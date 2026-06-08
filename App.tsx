@@ -35,6 +35,7 @@ type VoiceSceneResponse = {
   followUpPrompt?: string;
   focusX?: number;
   focusY?: number;
+  notebook?: Partial<NotebookOverlayContent> | null;
   sceneSummary?: string;
   spokenPrompt?: string;
 };
@@ -46,14 +47,23 @@ type VisualFollowUpResponse = {
   focusLabel?: string;
   focusX?: number;
   focusY?: number;
+  notebook?: Partial<NotebookOverlayContent> | null;
   resolved?: boolean;
   sceneSummary?: string;
 };
 
-const API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-const ANALYSIS_MODEL = 'gemini-2.5-flash';
-const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
-const TTS_VOICE = 'Kore';
+type NotebookOverlayContent = {
+  answerLine?: string;
+  intro?: string;
+  steps: string[];
+  title: string;
+};
+
+type ApiTurnResponse<T> = {
+  result: T;
+  ttsAudioBase64?: string;
+};
+
 const MAX_ANNOTATIONS = 3;
 const AUTO_STOP_SILENCE_MS = 1200;
 const MIN_RECORDING_MS = 900;
@@ -67,6 +77,44 @@ const COLOR_MAP: Record<string, string> = {
   lime: '#B8E54E',
   mint: '#66E5AE',
 };
+
+const API_BASE_URL =
+  Platform.OS === 'web' ? '' : process.env.EXPO_PUBLIC_API_BASE_URL?.trim() ?? '';
+const CLIENT_GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY?.trim() ?? '';
+const ANALYSIS_MODEL = 'gemini-2.5-flash';
+const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+const TTS_VOICE = 'Kore';
+const HANDWRITING_FONT_FAMILY = Platform.select({
+  android: 'sans-serif-medium',
+  ios: 'Noteworthy',
+  web: 'cursive',
+  default: undefined,
+});
+const VOICE_SCENE_PROMPT =
+  'You are Ved, a camera assistant. The user has sent a photo and a short voice question. ' +
+  'Transcribe the spoken question, ignore a leading wake phrase like "Hey Ved" if present, ' +
+  'answer in one very short spoken sentence whenever possible, and return only JSON. ' +
+  'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, focusX, focusY, focusLabel, cameraZoom, annotations, and notebook. ' +
+  'sceneSummary should be one concise sentence. ' +
+  'annotations should be an array of up to 3 objects with label, reason, x, y, color, placement, lineWidth, and lineHeight. ' +
+  'notebook should be null unless the user asks for the correct way, the proper working, the step-by-step solution, or how to fix a wrong calculation. ' +
+  'When notebook is present, set it to an object with title, intro, steps, and answerLine. Use the title "Correct way" unless the user clearly asks for a different label. steps should have 2 to 5 short handwritten-style lines that show the correct working clearly. If the user asks for the correct way after showing a wrong calculation, always include notebook. ' +
+  'x and y must be normalized values between 0 and 1. ' +
+  'color must be one of cyan, amber, coral, mint, lime. ' +
+  'placement must be one of left, right, top, or bottom and describes where the callout card should sit relative to the target point. ' +
+  'Only annotate the specific region that answers the user question or shows the likely issue. Never annotate every visible object. ' +
+  'If the user asks what is wrong, what is incorrect, what failed, or what to fix, annotate only the wrong or suspicious parts. ' +
+  'When a specific object, line, equation, or region is important, include focusX, focusY, a short focusLabel, and cameraZoom between 0 and 0.7 so the app can emphasize that region. ' +
+  'Keep answerText natural and conversational for spoken playback, but short enough to speak quickly. ' +
+  'If the user asks to check a notebook, homework, calculation, equation, or math answer and the image does not clearly show readable math, set followUpMode to "show_notebook_math", set followUpPrompt to a short instruction asking them to show the notebook clearly, and keep answerText aligned with that request. ' +
+  'If the math is visible and readable, set followUpMode to "none" and solve or explain it briefly.';
+const NOTEBOOK_FOLLOW_UP_PROMPT =
+  'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. ' +
+  'If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a very short spoken answerText, focusX, focusY, focusLabel, cameraZoom, annotations, and notebook. ' +
+  'Use at most 3 annotations. Each annotation should include label, reason, x, y, color, placement, lineWidth, and lineHeight. ' +
+  'If the user is asking for the correct way, proper working, or fixed calculation, set notebook to an object with title, intro, steps, and answerLine so the app can render a handwritten notebook popup. Use the title "Correct way". In that case, always include notebook when the math is readable. Otherwise set notebook to null. ' +
+  'Use transparent callout-style placements like left, right, top, or bottom. ' +
+  'If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.';
 
 export default function App() {
   const cameraRef = useRef<CameraView | null>(null);
@@ -86,8 +134,9 @@ export default function App() {
   const [cameraZoom, setCameraZoom] = useState(0);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [sceneSummary, setSceneSummary] = useState(
-    'Ved is always listening while this app is open. Say "Hey Ved..." and pause when you are done.',
+    'Say "Hey Ved..." and ask your question.',
   );
+  const [pendingSceneSummary, setPendingSceneSummary] = useState<string | null>(null);
   const [statusLine, setStatusLine] = useState('Ready');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
@@ -99,6 +148,8 @@ export default function App() {
   const [pendingFollowUpMode, setPendingFollowUpMode] = useState<'show_notebook_math' | null>(null);
   const [followUpPrompt, setFollowUpPrompt] = useState<string | null>(null);
   const [focusGuide, setFocusGuide] = useState<FocusGuide | null>(null);
+  const [notebookOverlay, setNotebookOverlay] = useState<NotebookOverlayContent | null>(null);
+  const [isPreparingSpeech, setIsPreparingSpeech] = useState(false);
 
   const canStartListening = useMemo(
     () =>
@@ -234,7 +285,7 @@ export default function App() {
         }),
         cameraRef.current.takePictureAsync({
           base64: true,
-          quality: 0.35,
+          quality: 0.26,
           skipProcessing: true,
         }),
       ]);
@@ -243,12 +294,12 @@ export default function App() {
         throw new Error('Camera capture did not include base64 image data.');
       }
 
-      const voiceResult = await requestVoiceSceneTurn({
-        apiKey: API_KEY ?? '',
+      const voiceTurn = await requestVoiceSceneTurn({
         audioBase64,
         audioMimeType: getAudioMimeType(),
         imageBase64: photo.base64,
       });
+      const voiceResult = voiceTurn.result;
 
       const parsedAnnotations = normalizeAnnotations(voiceResult);
       const followUpMode =
@@ -260,6 +311,11 @@ export default function App() {
         voiceResult.answerText?.trim() ||
         voiceResult.sceneSummary?.trim() ||
         'I can see the scene, but I need a clearer question to answer well.';
+      const resolvedSceneSummary =
+        (followUpMode
+          ? voiceResult.followUpPrompt?.trim()
+          : voiceResult.sceneSummary?.trim()) ||
+        'Updated the markers and answered out loud.';
 
       setAnnotations(parsedAnnotations);
       setPendingFollowUpMode(followUpMode);
@@ -270,21 +326,30 @@ export default function App() {
       );
       setFocusGuide(focus);
       setCameraZoom(focus?.zoom ?? 0);
+      setNotebookOverlay(normalizeNotebookOverlay(voiceResult.notebook));
+      setPendingSceneSummary(resolvedSceneSummary);
       setSceneSummary(
-        (followUpMode
-          ? voiceResult.followUpPrompt?.trim()
-          : voiceResult.sceneSummary?.trim()) ||
-          'Ved updated the markers and answered out loud.',
+        followUpMode
+          ? 'Ved is getting the next step ready...'
+          : voiceTurn.ttsAudioBase64
+            ? 'Ved is about to reply.'
+            : 'Ved is preparing the voice reply.'
       );
-      setStatusLine('Speaking');
+      setStatusLine(voiceTurn.ttsAudioBase64 ? 'Speaking' : 'Preparing voice');
+      setIsPreparingSpeech(!voiceTurn.ttsAudioBase64);
 
-      await speakWithGemini({
-        apiKey: API_KEY ?? '',
+      await playSpeech({
+        audioBase64: voiceTurn.ttsAudioBase64,
         soundRef,
         text: resolvedAnswer,
-        onStart: () => setIsSpeaking(true),
+        onStart: () => {
+          setIsSpeaking(true);
+          setSceneSummary(resolvedSceneSummary);
+          setPendingSceneSummary(null);
+        },
         onDone: () => {
           setIsSpeaking(false);
+          setIsPreparingSpeech(false);
           setStatusLine('Ready');
         },
       });
@@ -294,6 +359,8 @@ export default function App() {
       setErrorMessage(message);
       setStatusLine('Listening will resume');
       setIsSpeaking(false);
+      setIsPreparingSpeech(false);
+      setPendingSceneSummary(null);
     } finally {
       isStoppingRef.current = false;
       hasHeardSpeechRef.current = false;
@@ -307,10 +374,10 @@ export default function App() {
   }, [stopVoiceCapture]);
 
   const startVoiceCapture = useCallback(async () => {
-    if (!API_KEY) {
+    if (!isBackendConfigured()) {
       Alert.alert(
-        'Gemini key missing',
-        'Add EXPO_PUBLIC_GEMINI_API_KEY to your environment before running the app.',
+        'Backend not configured',
+        'For web deployments, host the app with the bundled Vercel API routes. For native builds, set EXPO_PUBLIC_API_BASE_URL to your deployed backend URL.',
       );
       return;
     }
@@ -481,7 +548,7 @@ export default function App() {
 
       const photo = await cameraRef.current.takePictureAsync({
         base64: true,
-        quality: 0.4,
+        quality: 0.3,
         skipProcessing: true,
       });
 
@@ -490,43 +557,56 @@ export default function App() {
       }
 
       const followUpResult = await requestVisualFollowUp({
-        apiKey: API_KEY ?? '',
         imageBase64: photo.base64,
         mode: pendingFollowUpMode,
       });
+      const followUpTurn = followUpResult;
+      const followUpPayload = followUpTurn.result;
 
-      if (!followUpResult.resolved) {
+      if (!followUpPayload.resolved) {
         setFocusGuide(null);
         setCameraZoom(0);
         setSceneSummary(
           followUpPrompt ||
-            followUpResult.sceneSummary?.trim() ||
+            followUpPayload.sceneSummary?.trim() ||
             'Bring the notebook closer and keep it steady.',
         );
         return;
       }
 
-      setAnnotations(normalizeAnnotations(followUpResult));
-      const followUpFocus = normalizeFocusGuide(followUpResult);
+      setAnnotations(normalizeAnnotations(followUpPayload));
+      const followUpFocus = normalizeFocusGuide(followUpPayload);
       setPendingFollowUpMode(null);
       setFollowUpPrompt(null);
       setFocusGuide(followUpFocus);
       setCameraZoom(followUpFocus?.zoom ?? 0.12);
+      setNotebookOverlay(normalizeNotebookOverlay(followUpPayload.notebook));
+      const resolvedFollowUpSummary =
+        followUpPayload.sceneSummary?.trim() ||
+        'Found the notebook and is explaining the math now.';
+      setPendingSceneSummary(resolvedFollowUpSummary);
       setSceneSummary(
-        followUpResult.sceneSummary?.trim() ||
-          'Ved found the notebook and is explaining the math now.',
+        followUpTurn.ttsAudioBase64
+          ? 'Ved found it and is about to reply.'
+          : 'Ved is preparing the voice reply.'
       );
-      setStatusLine('Speaking');
+      setStatusLine(followUpTurn.ttsAudioBase64 ? 'Speaking' : 'Preparing voice');
+      setIsPreparingSpeech(!followUpTurn.ttsAudioBase64);
 
-      await speakWithGemini({
-        apiKey: API_KEY ?? '',
+      await playSpeech({
+        audioBase64: followUpTurn.ttsAudioBase64,
         soundRef,
         text:
-          followUpResult.answerText?.trim() ||
+          followUpPayload.answerText?.trim() ||
           'I can see the notebook now, but I need a clearer frame to explain the math well.',
-        onStart: () => setIsSpeaking(true),
+        onStart: () => {
+          setIsSpeaking(true);
+          setSceneSummary(resolvedFollowUpSummary);
+          setPendingSceneSummary(null);
+        },
         onDone: () => {
           setIsSpeaking(false);
+          setIsPreparingSpeech(false);
           setStatusLine('Ready');
         },
       });
@@ -535,6 +615,8 @@ export default function App() {
         error instanceof Error ? error.message : 'Ved could not scan the notebook yet.';
       setErrorMessage(message);
       setStatusLine('Waiting for a clearer notebook view');
+      setIsPreparingSpeech(false);
+      setPendingSceneSummary(null);
     } finally {
       isVisualScanInFlightRef.current = false;
     }
@@ -674,26 +756,6 @@ export default function App() {
       </View>
 
       <SafeAreaView style={styles.safeArea}>
-        <View style={styles.topBar}>
-          <View style={styles.badge}>
-            <Text style={styles.badgeText}>Ved voice mode</Text>
-          </View>
-          <View style={styles.badge}>
-            <Text style={styles.badgeText}>
-              {isRecording ? 'Listening' : isSpeaking ? 'Speaking' : isBusy ? 'Thinking' : 'Ready'}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.sideActions}>
-          <Pressable
-            onPress={() => setIsPanelOpen((current) => !current)}
-            style={styles.panelToggle}
-          >
-            <Text style={styles.panelToggleText}>{isPanelOpen ? 'Hide panel' : 'Show panel'}</Text>
-          </Pressable>
-        </View>
-
         {isPanelOpen ? (
           <View style={styles.bottomPanel}>
             <View style={styles.panelHeader}>
@@ -717,15 +779,72 @@ export default function App() {
             <View style={styles.metaRow}>
               <Text style={styles.metaText}>
                 {isRecording
-                  ? `Listening ${formatDuration(recordingMillis)}. Stop speaking to send.`
+                  ? `Listening ${formatDuration(recordingMillis)}.`
                   : pendingFollowUpMode
-                    ? 'Ved is scanning the camera for your notebook and equations.'
+                      ? 'Ved is scanning the notebook view.'
+                  : isPreparingSpeech
+                    ? 'Ved is shaping the voice reply.'
                   : isSpeaking
                     ? 'Ved is speaking back.'
                     : isBusy
-                      ? 'Ved is processing your request.'
-                      : 'Ved is always listening while this app is open.'}
+                      ? 'Ved is thinking.'
+                      : 'Ved is listening.'}
               </Text>
+            </View>
+          </View>
+        ) : null}
+
+        {!isPanelOpen ? (
+          <Pressable
+            onPress={() => setIsPanelOpen(true)}
+            style={styles.panelDock}
+          >
+            <Text style={styles.panelDockText}>Ved</Text>
+          </Pressable>
+        ) : null}
+
+        {notebookOverlay ? (
+          <View style={styles.notebookBackdrop}>
+            <View style={styles.notebookCard}>
+              <View style={styles.notebookHeader}>
+                <Text style={styles.notebookTitle}>{notebookOverlay.title}</Text>
+                <Pressable
+                  onPress={() => setNotebookOverlay(null)}
+                  style={styles.notebookCloseButton}
+                >
+                  <Text style={styles.notebookCloseText}>Close</Text>
+                </Pressable>
+              </View>
+              <View style={styles.notebookPaper}>
+                {Array.from({ length: 7 }).map((_, index) => (
+                  <View key={index} style={[styles.notebookRule, { top: 66 + index * 42 }]} />
+                ))}
+                <View style={styles.notebookMargin} />
+                {notebookOverlay.intro ? (
+                  <Text style={[styles.notebookIntro, styles.handwrittenText]}>
+                    {notebookOverlay.intro}
+                  </Text>
+                ) : null}
+                <View style={styles.notebookSteps}>
+                  {notebookOverlay.steps.map((step, index) => (
+                    <Text
+                      key={`${step}-${index}`}
+                      style={[
+                        styles.notebookStep,
+                        styles.handwrittenText,
+                        { transform: [{ rotate: `${index % 2 === 0 ? -1.4 : 1.1}deg` }] },
+                      ]}
+                    >
+                      {step}
+                    </Text>
+                  ))}
+                </View>
+                {notebookOverlay.answerLine ? (
+                  <Text style={[styles.notebookAnswer, styles.handwrittenText]}>
+                    {notebookOverlay.answerLine}
+                  </Text>
+                ) : null}
+              </View>
             </View>
           </View>
         ) : null}
@@ -735,209 +854,173 @@ export default function App() {
 }
 
 type RequestVoiceSceneTurnArgs = {
-  apiKey: string;
   audioBase64: string;
   audioMimeType: string;
   imageBase64: string;
 };
 
 async function requestVoiceSceneTurn({
-  apiKey,
   audioBase64,
   audioMimeType,
   imageBase64,
-}: RequestVoiceSceneTurnArgs): Promise<VoiceSceneResponse> {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${ANALYSIS_MODEL}:generateContent?key=${apiKey}`,
-    {
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text:
-                  'You are Ved, a camera assistant. The user has sent a photo and a short voice question. ' +
-                  'Transcribe the spoken question, ignore a leading wake phrase like "Hey Ved" if present, ' +
-                  'answer in one or two short spoken sentences, and return only JSON. ' +
-                  'Use keys spokenPrompt, answerText, sceneSummary, followUpMode, followUpPrompt, focusX, focusY, focusLabel, cameraZoom, and annotations. ' +
-                  'sceneSummary should be one concise sentence. ' +
-                  'annotations should be an array of up to 3 objects with label, reason, x, y, color, placement, lineWidth, and lineHeight. ' +
-                  'x and y must be normalized values between 0 and 1. ' +
-                  'color must be one of cyan, amber, coral, mint, lime. ' +
-                  'placement must be one of left, right, top, or bottom and describes where the callout card should sit relative to the target point. ' +
-                  'Only annotate the specific region that answers the user question or shows the likely issue. Never annotate every visible object. ' +
-                  'If the user asks what is wrong, what is incorrect, what failed, or what to fix, annotate only the wrong or suspicious parts. ' +
-                  'When a specific object, line, equation, or region is important, include focusX, focusY, a short focusLabel, and cameraZoom between 0 and 0.7 so the app can emphasize that region. ' +
-                  'Keep answerText natural and conversational for spoken playback. ' +
-                  'If the user asks to check a notebook, homework, calculation, equation, or math answer and the image does not clearly show readable math, set followUpMode to "show_notebook_math", set followUpPrompt to a short instruction asking them to show the notebook clearly, and keep answerText aligned with that request. ' +
-                  'If the math is visible and readable, set followUpMode to "none" and solve or explain it briefly.',
+}: RequestVoiceSceneTurnArgs): Promise<ApiTurnResponse<VoiceSceneResponse>> {
+  if (!getApiBaseUrl()) {
+    const payload = await callGeminiDirect(ANALYSIS_MODEL, {
+      contents: [
+        {
+          parts: [
+            { text: VOICE_SCENE_PROMPT },
+            {
+              inlineData: {
+                data: imageBase64,
+                mimeType: 'image/jpeg',
               },
-              {
-                inlineData: {
-                  data: imageBase64,
-                  mimeType: 'image/jpeg',
-                },
+            },
+            {
+              inlineData: {
+                data: audioBase64,
+                mimeType: audioMimeType,
               },
-              {
-                inlineData: {
-                  data: audioBase64,
-                  mimeType: audioMimeType,
-                },
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.35,
+            },
+          ],
         },
-      }),
-      headers: {
-        'Content-Type': 'application/json',
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.35,
       },
-      method: 'POST',
+    });
+
+    const result = parseGeminiJson(extractCandidateText(payload)) as VoiceSceneResponse;
+    return {
+      result,
+      ttsAudioBase64: await synthesizeSpeechDirect(result.answerText),
+    };
+  }
+
+  const response = await fetch(`${getApiBaseUrl()}/api/voice-scene`, {
+    body: JSON.stringify({
+      audioBase64,
+      audioMimeType,
+      imageBase64,
+    }),
+    headers: {
+      'Content-Type': 'application/json',
     },
-  );
+    method: 'POST',
+  });
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Gemini analysis failed: ${response.status} ${errorText}`);
   }
 
-  const payload = await response.json();
-  const text = payload?.candidates?.[0]?.content?.parts
-    ?.map((part: { text?: string }) => part.text ?? '')
-    .join('');
-
-  if (!text) {
-    throw new Error('Gemini did not return a voice-scene response.');
-  }
-
-  return parseGeminiJson(text);
+  return (await response.json()) as ApiTurnResponse<VoiceSceneResponse>;
 }
 
 type RequestVisualFollowUpArgs = {
-  apiKey: string;
   imageBase64: string;
   mode: 'show_notebook_math';
 };
 
 async function requestVisualFollowUp({
-  apiKey,
   imageBase64,
   mode,
-}: RequestVisualFollowUpArgs): Promise<VisualFollowUpResponse> {
-  const prompt =
-    mode === 'show_notebook_math'
-      ? 'You are Ved, a camera tutor. Look for a notebook page, handwritten math, printed equations, or calculations. If the math is visible and readable, return JSON with resolved=true, a concise sceneSummary, a short spoken answerText that explains or solves the visible math, focusX, focusY, focusLabel, cameraZoom, and annotations that point only to the wrong or most relevant lines or equations. Use at most 3 annotations. Each annotation should include label, reason, x, y, color, placement, lineWidth, and lineHeight. Use transparent callout-style placements like left, right, top, or bottom. If the notebook or math is not yet readable, return resolved=false with a short sceneSummary telling the user to bring the notebook closer, flatter, and steadier. Return only JSON.'
-      : 'Return only JSON.';
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${ANALYSIS_MODEL}:generateContent?key=${apiKey}`,
-    {
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              {
-                inlineData: {
-                  data: imageBase64,
-                  mimeType: 'image/jpeg',
-                },
+}: RequestVisualFollowUpArgs): Promise<ApiTurnResponse<VisualFollowUpResponse>> {
+  if (!getApiBaseUrl()) {
+    const prompt = mode === 'show_notebook_math' ? NOTEBOOK_FOLLOW_UP_PROMPT : 'Return only JSON.';
+    const payload = await callGeminiDirect(ANALYSIS_MODEL, {
+      contents: [
+        {
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                data: imageBase64,
+                mimeType: 'image/jpeg',
               },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.2,
+            },
+          ],
         },
-      }),
-      headers: {
-        'Content-Type': 'application/json',
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.2,
       },
-      method: 'POST',
+    });
+
+    const result = parseGeminiJson(extractCandidateText(payload)) as VisualFollowUpResponse;
+    return {
+      result,
+      ttsAudioBase64: result.resolved ? await synthesizeSpeechDirect(result.answerText) : undefined,
+    };
+  }
+
+  const response = await fetch(`${getApiBaseUrl()}/api/visual-follow-up`, {
+    body: JSON.stringify({
+      imageBase64,
+      mode,
+    }),
+    headers: {
+      'Content-Type': 'application/json',
     },
-  );
+    method: 'POST',
+  });
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Gemini visual follow-up failed: ${response.status} ${errorText}`);
   }
 
-  const payload = await response.json();
-  const text = payload?.candidates?.[0]?.content?.parts
-    ?.map((part: { text?: string }) => part.text ?? '')
-    .join('');
-
-  if (!text) {
-    throw new Error('Gemini did not return a visual follow-up response.');
-  }
-
-  return parseGeminiJson(text) as VisualFollowUpResponse;
+  return (await response.json()) as ApiTurnResponse<VisualFollowUpResponse>;
 }
 
-type SpeakWithGeminiArgs = {
-  apiKey: string;
+type PlaySpeechArgs = {
+  audioBase64?: string;
   onDone: () => void;
   onStart: () => void;
   soundRef: React.MutableRefObject<Audio.Sound | null>;
   text: string;
 };
 
-async function speakWithGemini({
-  apiKey,
+async function playSpeech({
+  audioBase64,
   onDone,
   onStart,
   soundRef,
   text,
-}: SpeakWithGeminiArgs) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${apiKey}`,
-    {
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text: `[friendly, helpful] ${text}`,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            languageCode: 'en-IN',
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: TTS_VOICE,
-              },
-            },
-          },
-        },
-      }),
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      method: 'POST',
-    },
-  );
+}: PlaySpeechArgs) {
+  let resolvedAudioBase64 = audioBase64;
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini TTS failed: ${response.status} ${errorText}`);
+  if (!resolvedAudioBase64) {
+    if (!getApiBaseUrl()) {
+      resolvedAudioBase64 = await synthesizeSpeechDirect(text);
+    } else {
+      const response = await fetch(`${getApiBaseUrl()}/api/tts`, {
+        body: JSON.stringify({
+          text,
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Gemini TTS failed: ${response.status} ${errorText}`);
+      }
+
+      const payload = await response.json();
+      resolvedAudioBase64 = payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    }
   }
 
-  const payload = await response.json();
-  const audioBase64 = payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-  if (!audioBase64) {
+  if (!resolvedAudioBase64) {
     throw new Error('Gemini did not return audio output.');
   }
 
-  const wavBase64 = pcmToWavBase64(audioBase64, 24000, 1, 16);
+  const wavBase64 = pcmToWavBase64(resolvedAudioBase64, 24000, 1, 16);
   const fileUri = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory}ved-response-${Date.now()}.wav`;
   await FileSystem.writeAsStringAsync(fileUri, wavBase64, {
     encoding: FileSystem.EncodingType.Base64,
@@ -974,6 +1057,109 @@ async function stopSoundPlayback(soundRef: React.MutableRefObject<Audio.Sound | 
   const sound = soundRef.current;
   soundRef.current = null;
   await sound.unloadAsync().catch(() => undefined);
+}
+
+function getApiBaseUrl() {
+  return API_BASE_URL;
+}
+
+function isBackendConfigured() {
+  return Platform.OS === 'web' || Boolean(API_BASE_URL) || Boolean(CLIENT_GEMINI_API_KEY);
+}
+
+async function callGeminiDirect(model: string, payload: Record<string, unknown>) {
+  if (!CLIENT_GEMINI_API_KEY) {
+    throw new Error('Missing EXPO_PUBLIC_GEMINI_API_KEY for native fallback mode.');
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CLIENT_GEMINI_API_KEY}`,
+    {
+      body: JSON.stringify(payload),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini request failed: ${response.status} ${errorText}`);
+  }
+
+  return response.json();
+}
+
+function extractCandidateText(payload: Record<string, any>) {
+  const text = payload?.candidates?.[0]?.content?.parts
+    ?.map((part: { text?: string }) => part.text ?? '')
+    .join('');
+
+  if (!text) {
+    throw new Error('Gemini did not return a valid text candidate.');
+  }
+
+  return text;
+}
+
+async function synthesizeSpeechDirect(text?: string) {
+  if (!text) {
+    return undefined;
+  }
+
+  const conciseText = makeSpeechConcise(text);
+  const payload = await callGeminiDirect(TTS_MODEL, {
+    contents: [
+      {
+        parts: [
+          {
+            text: `[friendly, helpful] ${conciseText}`,
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: {
+        languageCode: 'en-IN',
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: TTS_VOICE,
+          },
+        },
+      },
+    },
+  });
+
+  return payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+}
+
+function normalizeNotebookOverlay(
+  notebook: Partial<NotebookOverlayContent> | null | undefined,
+): NotebookOverlayContent | null {
+  if (!notebook || !Array.isArray(notebook.steps) || notebook.steps.length === 0) {
+    return null;
+  }
+
+  return {
+    answerLine:
+      typeof notebook.answerLine === 'string' && notebook.answerLine.trim()
+        ? notebook.answerLine.trim()
+        : undefined,
+    intro:
+      typeof notebook.intro === 'string' && notebook.intro.trim()
+        ? notebook.intro.trim()
+        : undefined,
+    steps: notebook.steps
+      .map((step) => (typeof step === 'string' ? step.trim() : ''))
+      .filter(Boolean)
+      .slice(0, 6),
+    title:
+      typeof notebook.title === 'string' && notebook.title.trim()
+        ? notebook.title.trim()
+        : 'Correct way',
+  };
 }
 
 function clearSilenceTimer(
@@ -1075,6 +1261,17 @@ function pcmToWavBase64(
   );
 
   return Buffer.concat([wavHeader, pcmBuffer]).toString('base64');
+}
+
+function makeSpeechConcise(text: string) {
+  const normalized = String(text).replace(/\s+/g, ' ').trim();
+  const firstSentence = normalized.match(/[^.!?]+[.!?]?/)?.[0]?.trim() ?? normalized;
+
+  if (firstSentence.length <= 120) {
+    return firstSentence;
+  }
+
+  return `${firstSentence.slice(0, 117).trim()}...`;
 }
 
 function createWavHeader(
@@ -1180,28 +1377,36 @@ function getAnnotationLineStyle(
   switch (placement) {
     case 'left':
       return {
+        borderStyle: 'dashed' as const,
         borderTopWidth: 2,
         marginLeft: 0,
         marginRight: 8,
+        transform: [{ rotate: '-4deg' }],
         width: lineWidth,
       };
     case 'top':
       return {
+        borderStyle: 'dashed' as const,
         borderLeftWidth: 2,
         height: lineHeight,
         marginBottom: 8,
+        transform: [{ rotate: '-3deg' }],
       };
     case 'bottom':
       return {
+        borderStyle: 'dashed' as const,
         borderLeftWidth: 2,
         height: lineHeight,
         marginTop: 8,
+        transform: [{ rotate: '3deg' }],
       };
     case 'right':
     default:
       return {
+        borderStyle: 'dashed' as const,
         borderTopWidth: 2,
         marginLeft: 8,
+        transform: [{ rotate: '4deg' }],
         width: lineWidth,
       };
   }
@@ -1264,24 +1469,27 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
   },
   annotationCard: {
-    backgroundColor: 'rgba(12, 16, 27, 0.42)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
-    borderRadius: 16,
+    backgroundColor: 'rgba(251, 247, 232, 0.96)',
+    borderColor: 'rgba(115, 147, 196, 0.34)',
+    borderRadius: 18,
     borderWidth: 1,
     maxWidth: 210,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    transform: [{ rotate: '-1.5deg' }],
   },
   annotationDot: {
-    borderColor: 'rgba(255, 255, 255, 0.65)',
+    borderColor: 'rgba(251, 247, 232, 0.88)',
     borderRadius: 9,
     borderWidth: 2,
     height: 18,
     width: 18,
   },
   annotationLabel: {
-    color: '#F7FAFF',
-    fontSize: 13,
+    color: '#244A82',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontSize: 16,
+    fontStyle: 'italic',
     fontWeight: '700',
   },
   annotationLine: {
@@ -1300,17 +1508,22 @@ const styles = StyleSheet.create({
     position: 'absolute',
   },
   focusGuideLabel: {
-    color: '#F4FAFF',
-    fontSize: 11,
+    color: '#22497A',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontSize: 13,
+    fontStyle: 'italic',
     fontWeight: '700',
   },
   focusGuideLabelWrap: {
     alignSelf: 'center',
-    backgroundColor: 'rgba(10, 18, 30, 0.52)',
-    borderRadius: 999,
+    backgroundColor: 'rgba(249, 244, 227, 0.92)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(111, 140, 180, 0.35)',
     marginTop: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
+    transform: [{ rotate: '-2deg' }],
   },
   focusGuideRing: {
     borderColor: 'rgba(124, 231, 255, 0.95)',
@@ -1320,9 +1533,11 @@ const styles = StyleSheet.create({
     width: 68,
   },
   annotationReason: {
-    color: '#D5E1F2',
-    fontSize: 11,
-    lineHeight: 15,
+    color: '#47617D',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontSize: 13,
+    fontStyle: 'italic',
+    lineHeight: 17,
     marginTop: 4,
   },
   annotationWrap: {
@@ -1331,19 +1546,6 @@ const styles = StyleSheet.create({
   appShell: {
     backgroundColor: '#08111D',
     flex: 1,
-  },
-  badge: {
-    backgroundColor: 'rgba(7, 13, 22, 0.58)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
-    borderRadius: 999,
-    borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  badgeText: {
-    color: '#F3F7FF',
-    fontSize: 12,
-    fontWeight: '700',
   },
   bottomPanel: {
     alignSelf: 'stretch',
@@ -1429,18 +1631,21 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     maxWidth: 260,
   },
-  panelToggle: {
-    backgroundColor: 'rgba(6, 10, 18, 0.72)',
-    borderColor: 'rgba(255, 255, 255, 0.12)',
+  panelDock: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(6, 10, 18, 0.42)',
+    borderColor: 'rgba(255, 255, 255, 0.1)',
     borderRadius: 999,
     borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    marginTop: 'auto',
+    paddingHorizontal: 16,
+    paddingVertical: 9,
   },
-  panelToggleText: {
+  panelDockText: {
     color: '#E7F3FF',
     fontSize: 12,
     fontWeight: '700',
+    letterSpacing: 0.3,
   },
   permissionButton: {
     alignItems: 'center',
@@ -1461,16 +1666,107 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingBottom: 14,
   },
-  sideActions: {
-    alignItems: 'flex-end',
-    paddingHorizontal: 14,
-    paddingTop: 10,
+  handwrittenText: {
+    color: '#214B88',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontStyle: 'italic',
   },
-  topBar: {
+  notebookAnswer: {
+    color: '#173E76',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontSize: 18,
+    fontStyle: 'italic',
+    fontWeight: '700',
+    marginTop: 14,
+    transform: [{ rotate: '-0.8deg' }],
+  },
+  notebookBackdrop: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(2, 8, 15, 0.32)',
+    bottom: 0,
+    justifyContent: 'center',
+    left: 0,
+    paddingHorizontal: 18,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  notebookCard: {
+    backgroundColor: '#FFFDF6',
+    borderColor: 'rgba(83, 114, 163, 0.22)',
+    borderRadius: 26,
+    borderWidth: 1,
+    maxWidth: 420,
+    padding: 14,
+    shadowColor: '#04101D',
+    shadowOffset: { width: 0, height: 18 },
+    shadowOpacity: 0.24,
+    shadowRadius: 28,
+    width: '100%',
+  },
+  notebookCloseButton: {
+    backgroundColor: 'rgba(24, 61, 121, 0.08)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  notebookCloseText: {
+    color: '#284A7C',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  notebookHeader: {
+    alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingHorizontal: 14,
-    paddingTop: 10,
+    marginBottom: 12,
+  },
+  notebookIntro: {
+    fontSize: 17,
+    lineHeight: 24,
+    marginBottom: 12,
+    transform: [{ rotate: '-1deg' }],
+  },
+  notebookMargin: {
+    backgroundColor: 'rgba(226, 114, 114, 0.3)',
+    bottom: 16,
+    left: 28,
+    position: 'absolute',
+    top: 16,
+    width: 2,
+  },
+  notebookPaper: {
+    backgroundColor: '#FFFDF6',
+    borderRadius: 18,
+    minHeight: 320,
+    overflow: 'hidden',
+    paddingBottom: 18,
+    paddingHorizontal: 46,
+    paddingTop: 24,
+    position: 'relative',
+  },
+  notebookRule: {
+    backgroundColor: 'rgba(101, 146, 214, 0.16)',
+    height: 1,
+    left: 16,
+    position: 'absolute',
+    right: 16,
+  },
+  notebookStep: {
+    fontSize: 18,
+    lineHeight: 26,
+    marginBottom: 10,
+  },
+  notebookSteps: {
+    marginTop: 4,
+  },
+  notebookTitle: {
+    color: '#1E4277',
+    fontFamily: HANDWRITING_FONT_FAMILY,
+    fontSize: 22,
+    fontStyle: 'italic',
+    fontWeight: '700',
+    transform: [{ rotate: '-1.2deg' }],
   },
   voiceButton: {
     alignItems: 'center',
