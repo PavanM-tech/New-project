@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server';
 
-import { analyzeFrame } from '../../../lib/gemini';
+import { analyzeFrame, type ConversationTurn } from '../../../lib/gemini';
 
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as {
+      history?: ConversationTurn[];
       imageBase64?: string;
       question?: string;
     };
@@ -16,7 +17,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = await analyzeFrame(body.question, body.imageBase64);
+    const result = await analyzeFrame(body.question, body.imageBase64, body.history ?? []);
 
     return NextResponse.json({ result });
   } catch (error) {

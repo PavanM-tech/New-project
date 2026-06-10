@@ -33,6 +33,11 @@ type AnalyzeResponse = {
   sceneSummary?: string;
 };
 
+type ConversationTurn = {
+  answer?: string;
+  question: string;
+};
+
 type SpeechRecognitionConstructor = new () => SpeechRecognition;
 
 type SpeechRecognition = EventTarget & {
@@ -79,6 +84,7 @@ export default function Page() {
   const [isPanelOpen, setIsPanelOpen] = useState(true);
   const [manualQuestion, setManualQuestion] = useState('');
   const [notebookOverlay, setNotebookOverlay] = useState<NotebookOverlay | null>(null);
+  const [conversationHistory, setConversationHistory] = useState<ConversationTurn[]>([]);
   const [questionText, setQuestionText] = useState('');
   const [sceneSummary, setSceneSummary] = useState(
     'Open the camera, ask a question, and Ved will only inspect the part that matters.',
@@ -300,7 +306,6 @@ export default function Page() {
 
     try {
       setErrorMessage(null);
-      setNotebookOverlay(null);
       setAssistantState('thinking');
       setQuestionText(cleanedQuestion);
       setSceneSummary(
@@ -316,6 +321,7 @@ export default function Page() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          history: conversationHistory,
           imageBase64,
           question: cleanedQuestion,
         }),
@@ -340,7 +346,14 @@ export default function Page() {
           : 'Ved answered directly from your question.');
 
       setAnnotations(normalizeAnnotations(result));
-      setNotebookOverlay(normalizeNotebookOverlay(result.notebook));
+      setNotebookOverlay((current) => normalizeNotebookOverlay(result.notebook) ?? current);
+      setConversationHistory((current) => [
+        ...current.slice(-7),
+        {
+          answer: answerText,
+          question: cleanedQuestion,
+        },
+      ]);
       setSceneSummary(summaryText);
       setAssistantState('replying');
       void speakAnswer(answerText, () => setAssistantState('idle'));
@@ -377,7 +390,7 @@ export default function Page() {
 
   function playBrowserSpeech(answerText: string, onDone: () => void) {
     window.speechSynthesis.cancel();
-    const chunks = humanizeForSpeech(answerText);
+    const chunks = humanizeForSpeech(addConversationalExpression(answerText));
     const voice = chooseBestVoice(availableVoicesRef.current);
 
     if (chunks.length === 0) {
@@ -790,6 +803,32 @@ function ensureSpeechPunctuation(sentence: string, isLast: boolean) {
   }
 
   return `${sentence}${isLast ? '.' : ','}`;
+}
+
+function addConversationalExpression(text: string) {
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  if (/^(hmm|okay|alright|haa|ah|let me see)/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/wrong|mistake|error|careful|not quite/i.test(trimmed)) {
+    return `Hmm, let me see. ${trimmed}`;
+  }
+
+  if (/correct|exactly|yes|right/i.test(trimmed)) {
+    return `Haa, now I get it. ${trimmed}`;
+  }
+
+  if (/explain|theorem|step|solution|because/i.test(trimmed)) {
+    return `Okay, let me walk you through it. ${trimmed}`;
+  }
+
+  return `Okay, let me see. ${trimmed}`;
 }
 
 function pcmBase64ToWavBlob(
