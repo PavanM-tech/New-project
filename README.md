@@ -1,23 +1,24 @@
-# Astra AR Prototype
+# Ved Web Prototype
 
-An Expo prototype for an Astra-style camera assistant that sends live frames to Gemini 2.5 Flash and renders annotation overlays on top of the preview.
+A Next.js front end for Ved that uses:
 
-## What this prototype does
+- live browser camera preview
+- browser speech recognition for faster voice input
+- browser speech synthesis for faster voice replies
+- Gemini 2.5 Flash only for frame analysis
 
-- Opens the rear camera in an Expo app
-- Captures a frame on demand or on a repeating live-scan interval
-- Sends the frame plus your prompt to Gemini 2.5 Flash
-- Renders Gemini's response as overlay labels with normalized screen positions
+That cuts the old lag caused by sending audio to Gemini for transcription and then waiting again for Gemini TTS.
 
-## What it does not do yet
+## What changed
 
-- True world-anchored AR with ARCore or ARKit
-- Persistent spatial mapping across camera movement
-- Voice conversation or continuous video streaming
+- The front end is now Next.js instead of the Expo UI.
+- Ved only analyzes the current camera frame when you ask a question.
+- The prompt is stricter about annotating only the part related to your question.
+- The older darker annotation style is restored.
+- A notebook popup still appears when Ved returns the correct working for a calculation.
+- The logo now animates differently for listening, thinking, and replying.
 
-This first version is intentionally Expo-friendly so you can test it immediately with your current setup.
-
-## Setup
+## Local setup
 
 1. Install dependencies:
 
@@ -25,38 +26,42 @@ This first version is intentionally Expo-friendly so you can test it immediately
 npm install
 ```
 
-2. Create a local env file and add your Gemini key:
+2. Create the env file:
 
 ```bash
 cp .env.example .env
 ```
 
-Add:
+3. Add your Gemini key:
 
-```bash
-EXPO_PUBLIC_GEMINI_API_KEY=your_actual_key
+```env
+GEMINI_API_KEY=your_actual_key
 ```
 
-3. Start the Expo app:
+4. Start the Next.js app:
 
 ```bash
-npm start
+npm run dev
 ```
 
-4. Open it in Expo Go on your device.
+5. Open [http://localhost:3000](http://localhost:3000)
 
-## How to use it
+## How Ved works now
 
-- Grant camera access
-- Point the phone camera at a scene
-- Adjust the prompt if you want Gemini to focus on a specific class of objects
-- Tap `Analyze frame` for a single inference
-- Tap `Start live scan` to refresh the overlay every few seconds
+- `Ask out loud` uses the browser speech API for low-latency capture.
+- Ved grabs one camera frame when you ask the question.
+- `/api/analyze` sends only the frame and the cleaned question to Gemini.
+- The browser speaks the answer locally, which is much faster than waiting for Gemini TTS.
 
-## Next steps for a stronger AR version
+## Useful prompts
 
-- Move from Expo Go to an Expo dev client
-- Prebuild native projects
-- Add ARCore or ARKit bindings for true 3D anchors
-- Replace normalized overlay points with tracked object positions or world anchors
-- Add a speech layer for live conversational guidance
+- `What is wrong here?`
+- `Check my calculation`
+- `Explain this step`
+- `Show the correct way`
+
+## Notes
+
+- Voice input works best in Chromium-based browsers on Android and desktop.
+- If browser speech recognition is unavailable, you can still use the quick actions or type your question.
+- The old Expo files are still in the repo for reference, but the active front end is the Next.js app.
