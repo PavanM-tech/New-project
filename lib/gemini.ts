@@ -1,4 +1,6 @@
 const ANALYSIS_MODEL = 'gemini-2.5-flash';
+const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+const TTS_VOICE = 'Kore';
 
 export type Annotation = {
   color?: 'cyan' | 'amber' | 'coral' | 'mint' | 'lime';
@@ -77,6 +79,26 @@ async function callGemini(payload: Record<string, unknown>) {
   return response.json();
 }
 
+async function callGeminiTts(payload: Record<string, unknown>) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${getApiKey()}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini TTS request failed: ${response.status} ${errorText}`);
+  }
+
+  return response.json();
+}
+
 function extractCandidateText(payload: Record<string, any>) {
   const text = payload?.candidates?.[0]?.content?.parts
     ?.map((part: { text?: string }) => part.text ?? '')
@@ -133,4 +155,42 @@ export async function analyzeFrame(question: string, imageBase64?: string | null
   });
 
   return parseJson<AnalyzeResponse>(extractCandidateText(payload));
+}
+
+export async function synthesizeSpeech(text: string) {
+  const spokenText = text
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 320);
+
+  if (!spokenText) {
+    return null;
+  }
+
+  const payload = await callGeminiTts({
+    contents: [
+      {
+        parts: [
+          {
+            text:
+              '[warm, expressive, natural, conversational, teacherly, lightly encouraging] ' +
+              spokenText,
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: {
+        languageCode: 'en-IN',
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: TTS_VOICE,
+          },
+        },
+      },
+    },
+  });
+
+  return payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
 }

@@ -64,6 +64,7 @@ const QUICK_ACTIONS = [
 const MAX_ANNOTATIONS = 2;
 
 export default function Page() {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
@@ -150,6 +151,10 @@ export default function Page() {
   useEffect(() => {
     return () => {
       window.speechSynthesis.cancel();
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -338,7 +343,7 @@ export default function Page() {
       setNotebookOverlay(normalizeNotebookOverlay(result.notebook));
       setSceneSummary(summaryText);
       setAssistantState('replying');
-      speakAnswer(answerText, () => setAssistantState('idle'));
+      void speakAnswer(answerText, () => setAssistantState('idle'));
     } catch (error) {
       setAssistantState('idle');
       setErrorMessage(
@@ -347,7 +352,30 @@ export default function Page() {
     }
   }
 
-  function speakAnswer(answerText: string, onDone: () => void) {
+  async function speakAnswer(answerText: string, onDone: () => void) {
+    try {
+      const response = await fetch('/api/speak', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text: answerText }),
+      });
+
+      const payload = (await response.json()) as { audioBase64?: string; error?: string };
+
+      if (response.ok && payload.audioBase64) {
+        await playPremiumAudio(payload.audioBase64, onDone);
+        return;
+      }
+    } catch {
+      // Fall back to browser speech below.
+    }
+
+    playBrowserSpeech(answerText, onDone);
+  }
+
+  function playBrowserSpeech(answerText: string, onDone: () => void) {
     window.speechSynthesis.cancel();
     const chunks = humanizeForSpeech(answerText);
     const voice = chooseBestVoice(availableVoicesRef.current);
@@ -389,6 +417,31 @@ export default function Page() {
     };
 
     speakNext();
+  }
+
+  async function playPremiumAudio(audioBase64: string, onDone: () => void) {
+    window.speechSynthesis.cancel();
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+
+    const wavBlob = pcmBase64ToWavBlob(audioBase64, 24000, 1, 16);
+    const audioUrl = URL.createObjectURL(wavBlob);
+    const audio = new Audio(audioUrl);
+    audioRef.current = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      audioRef.current = null;
+      onDone();
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(audioUrl);
+      audioRef.current = null;
+      onDone();
+    };
+    await audio.play();
   }
 
   function startListening() {
@@ -570,8 +623,8 @@ export default function Page() {
                       ? cameraReady
                         ? 'Checking the current frame only for what you asked.'
                         : 'Answering from your question and opening notebook help when useful.'
-                      : assistantState === 'replying'
-                        ? 'Replying with a more natural local browser voice for lower latency.'
+                    : assistantState === 'replying'
+                        ? 'Replying with a more natural voice and falling back locally if needed.'
                         : 'Ready for the next question.'}
                 </p>
               </div>
@@ -581,11 +634,25 @@ export default function Page() {
       </section>
 
       {notebookOverlay ? (
-        <div className="notebook-backdrop">
-          <div className="notebook-card">
+        <div
+          className="notebook-backdrop"
+          onClick={() => setNotebookOverlay(null)}
+          role="presentation"
+        >
+          <div
+            className="notebook-card"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label={notebookOverlay.title}
+          >
             <div className="notebook-header">
               <h2>{notebookOverlay.title}</h2>
-              <button className="secondary-button compact-button" onClick={() => setNotebookOverlay(null)} type="button">
+              <button
+                className="secondary-button compact-button notebook-close"
+                onClick={() => setNotebookOverlay(null)}
+                type="button"
+              >
                 Close
               </button>
             </div>
@@ -609,6 +676,30 @@ export default function Page() {
               {notebookOverlay.answerLine ? (
                 <p className="notebook-answer">{notebookOverlay.answerLine}</p>
               ) : null}
+            </div>
+            <div className="notebook-follow-up">
+              <label htmlFor="notebook-follow-up">Ask a follow-up about this working</label>
+              <div className="manual-row">
+                <input
+                  id="notebook-follow-up"
+                  onChange={(event) => setManualQuestion(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      submitManualQuestion();
+                    }
+                  }}
+                  placeholder="For example: why is this step wrong?"
+                  value={manualQuestion}
+                />
+                <button
+                  className="primary-button compact-button"
+                  disabled={!manualQuestion.trim()}
+                  onClick={submitManualQuestion}
+                  type="button"
+                >
+                  Ask
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -699,4 +790,39 @@ function ensureSpeechPunctuation(sentence: string, isLast: boolean) {
   }
 
   return `${sentence}${isLast ? '.' : ','}`;
+}
+
+function pcmBase64ToWavBlob(
+  pcmBase64: string,
+  sampleRate: number,
+  channels: number,
+  bitsPerSample: number,
+) {
+  const pcmBytes = Uint8Array.from(atob(pcmBase64), (char) => char.charCodeAt(0));
+  const wavBuffer = new ArrayBuffer(44 + pcmBytes.length);
+  const view = new DataView(wavBuffer);
+
+  writeAscii(view, 0, 'RIFF');
+  view.setUint32(4, 36 + pcmBytes.length, true);
+  writeAscii(view, 8, 'WAVE');
+  writeAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, (sampleRate * channels * bitsPerSample) / 8, true);
+  view.setUint16(32, (channels * bitsPerSample) / 8, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(view, 36, 'data');
+  view.setUint32(40, pcmBytes.length, true);
+
+  new Uint8Array(wavBuffer, 44).set(pcmBytes);
+
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
 }

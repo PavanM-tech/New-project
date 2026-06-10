@@ -426,6 +426,7 @@ h1 {
   padding: 24px;
   background: rgba(4, 10, 16, 0.44);
   backdrop-filter: blur(8px);
+  z-index: 40;
 }
 
 .notebook-card {
@@ -435,14 +436,23 @@ h1 {
   background: #fffdf6;
   border: 1px solid rgba(83, 114, 163, 0.22);
   box-shadow: 0 28px 80px rgba(0, 0, 0, 0.28);
+  max-height: min(88vh, 920px);
+  overflow: auto;
 }
 
 .notebook-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 12px;
+  margin: -16px -16px 12px;
+  padding: 16px;
+  background: rgba(255, 253, 246, 0.96);
+  border-bottom: 1px solid rgba(83, 114, 163, 0.12);
+  backdrop-filter: blur(6px);
 }
 
 .notebook-header h2 {
@@ -460,6 +470,11 @@ h1 {
   padding: 26px 44px 20px 48px;
   border-radius: 18px;
   background: #fffdf6;
+}
+
+.notebook-close {
+  position: sticky;
+  top: 0;
 }
 
 .notebook-rule {
@@ -501,6 +516,29 @@ h1 {
   margin: 18px 0 0;
   color: #163c73;
   font-size: 21px;
+}
+
+.notebook-follow-up {
+  margin-top: 14px;
+  padding: 14px 4px 4px;
+}
+
+.notebook-follow-up label {
+  display: block;
+  margin-bottom: 10px;
+  color: #35598b;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.notebook-follow-up input {
+  flex: 1;
+  min-width: 220px;
+  padding: 14px 16px;
+  border: 1px solid rgba(56, 89, 139, 0.14);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #163c73;
 }
 
 @keyframes breathe {
