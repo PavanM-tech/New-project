@@ -9,9 +9,9 @@ export async function POST(request: Request) {
       question?: string;
     };
 
-    if (!body.question || !body.imageBase64) {
+    if (!body.question) {
       return NextResponse.json(
-        { error: 'Missing question or image payload.' },
+        { error: 'Missing question payload.' },
         { status: 400 },
       );
     }

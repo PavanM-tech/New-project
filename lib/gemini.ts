@@ -30,7 +30,7 @@ export type AnalyzeResponse = {
 };
 
 const ANALYZE_PROMPT =
-  'You are Ved, a camera assistant. The user has shared one camera frame and a direct question. ' +
+  'You are Ved, a camera assistant and study helper. The user may share a camera frame, or may ask a direct question without any image. ' +
   'Return only JSON. Use keys answerText, sceneSummary, annotations, focusX, focusY, focusLabel, cameraZoom, and notebook. ' +
   'answerText should be short, direct, and spoken-friendly. ' +
   'sceneSummary should be one concise helper sentence for the UI. ' +
@@ -40,8 +40,9 @@ const ANALYZE_PROMPT =
   'If the question can be answered without a visual marker, return an empty annotations array. ' +
   'x and y must be normalized values between 0 and 1. ' +
   'color must be one of cyan, amber, coral, mint, lime. placement must be one of left, right, top, or bottom. ' +
-  'When the user asks for the correct way, proper working, or a fixed calculation and the math is readable, include notebook with title, intro, steps, and answerLine so the UI can show a notebook popup. Keep notebook null otherwise. ' +
+  'When the user asks for the correct way, proper working, a step-by-step solution, or a fixed calculation, include notebook with title, intro, steps, and answerLine so the UI can show a notebook popup, even if there is no image, as long as the question itself gives enough context. Keep notebook null otherwise. ' +
   'The notebook steps should be 2 to 5 short lines showing the corrected working clearly. ' +
+  'If there is no image and the question depends on seeing something, say that clearly and ask the user to open the camera or share the page. ' +
   'If the frame is unclear, ask the user to hold it steady or bring it closer.';
 
 function getApiKey() {
@@ -102,23 +103,27 @@ function parseJson<T>(text: string): T {
   }
 }
 
-export async function analyzeFrame(question: string, imageBase64: string) {
+export async function analyzeFrame(question: string, imageBase64?: string | null) {
   const cleanQuestion = question.replace(/^hey\s+ved[\s,.:;-]*/i, '').trim() || question.trim();
+  const parts: Array<Record<string, unknown>> = [
+    {
+      text: `${ANALYZE_PROMPT}\n\nUser question: ${cleanQuestion}`,
+    },
+  ];
+
+  if (imageBase64) {
+    parts.push({
+      inlineData: {
+        data: imageBase64,
+        mimeType: 'image/jpeg',
+      },
+    });
+  }
 
   const payload = await callGemini({
     contents: [
       {
-        parts: [
-          {
-            text: `${ANALYZE_PROMPT}\n\nUser question: ${cleanQuestion}`,
-          },
-          {
-            inlineData: {
-              data: imageBase64,
-              mimeType: 'image/jpeg',
-            },
-          },
-        ],
+        parts,
       },
     ],
     generationConfig: {

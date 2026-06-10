@@ -68,6 +68,7 @@ export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const availableVoicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const shouldRestartListeningRef = useRef(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [assistantState, setAssistantState] = useState<'idle' | 'listening' | 'thinking' | 'replying'>('idle');
@@ -83,6 +84,7 @@ export default function Page() {
   );
   const [supportsSpeech, setSupportsSpeech] = useState(false);
   const [transcriptPreview, setTranscriptPreview] = useState('');
+  const [voiceReady, setVoiceReady] = useState(false);
 
   useEffect(() => {
     const SpeechRecognitionCtor =
@@ -149,6 +151,20 @@ export default function Page() {
     return () => {
       window.speechSynthesis.cancel();
       streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    const updateVoices = () => {
+      availableVoicesRef.current = window.speechSynthesis.getVoices();
+      setVoiceReady(availableVoicesRef.current.length > 0);
+    };
+
+    updateVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', updateVoices);
+
+    return () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', updateVoices);
     };
   }, []);
 
@@ -282,9 +298,13 @@ export default function Page() {
       setNotebookOverlay(null);
       setAssistantState('thinking');
       setQuestionText(cleanedQuestion);
-      setSceneSummary('Ved is checking only the relevant part of the frame.');
+      setSceneSummary(
+        cameraReady
+          ? 'Ved is checking only the relevant part of the frame.'
+          : 'Ved is answering from your question and can open a notebook view without the camera.',
+      );
 
-      const imageBase64 = captureFrame();
+      const imageBase64 = cameraReady ? captureFrame() : undefined;
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: {
@@ -304,9 +324,15 @@ export default function Page() {
 
       const result = payload.result;
       const answerText =
-        result.answerText?.trim() || 'I need a slightly clearer view to answer that well.';
+        result.answerText?.trim() ||
+        (cameraReady
+          ? 'I need a slightly clearer view to answer that well.'
+          : 'I can help with that, but I need a little more detail from your question.');
       const summaryText =
-        result.sceneSummary?.trim() || 'Ved answered using the current camera frame.';
+        result.sceneSummary?.trim() ||
+        (cameraReady
+          ? 'Ved answered using the current camera frame.'
+          : 'Ved answered directly from your question.');
 
       setAnnotations(normalizeAnnotations(result));
       setNotebookOverlay(normalizeNotebookOverlay(result.notebook));
@@ -323,23 +349,46 @@ export default function Page() {
 
   function speakAnswer(answerText: string, onDone: () => void) {
     window.speechSynthesis.cancel();
+    const chunks = humanizeForSpeech(answerText);
+    const voice = chooseBestVoice(availableVoicesRef.current);
 
-    const utterance = new SpeechSynthesisUtterance(answerText);
-    const voice = window
-      .speechSynthesis
-      .getVoices()
-      .find((item) => item.lang.toLowerCase().includes('en-in'));
-
-    if (voice) {
-      utterance.voice = voice;
+    if (chunks.length === 0) {
+      onDone();
+      return;
     }
 
-    utterance.rate = 1.02;
-    utterance.pitch = 1;
-    utterance.onend = onDone;
-    utterance.onerror = onDone;
+    let index = 0;
 
-    window.speechSynthesis.speak(utterance);
+    const speakNext = () => {
+      if (index >= chunks.length) {
+        onDone();
+        return;
+      }
+
+      const chunk = chunks[index];
+      const utterance = new SpeechSynthesisUtterance(chunk.text);
+
+      if (voice) {
+        utterance.voice = voice;
+      }
+
+      utterance.lang = voice?.lang || 'en-IN';
+      utterance.rate = chunk.rate;
+      utterance.pitch = chunk.pitch;
+      utterance.volume = 1;
+      utterance.onend = () => {
+        index += 1;
+        speakNext();
+      };
+      utterance.onerror = () => {
+        index += 1;
+        speakNext();
+      };
+
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakNext();
   }
 
   function startListening() {
@@ -447,7 +496,7 @@ export default function Page() {
                 ) : (
                   <button
                     className="primary-button"
-                    disabled={!cameraReady}
+                    disabled={!cameraReady && !voiceReady}
                     onClick={startListening}
                     type="button"
                   >
@@ -473,7 +522,6 @@ export default function Page() {
               {QUICK_ACTIONS.map((action) => (
                 <button
                   className="chip"
-                  disabled={!cameraReady}
                   key={action}
                   onClick={() => void askVed(action)}
                   type="button"
@@ -499,7 +547,7 @@ export default function Page() {
                 />
                 <button
                   className="primary-button compact-button"
-                  disabled={!cameraReady || !manualQuestion.trim()}
+                  disabled={!manualQuestion.trim()}
                   onClick={submitManualQuestion}
                   type="button"
                 >
@@ -519,9 +567,11 @@ export default function Page() {
                   {assistantState === 'listening'
                     ? 'Listening to your question.'
                     : assistantState === 'thinking'
-                      ? 'Checking the current frame only for what you asked.'
+                      ? cameraReady
+                        ? 'Checking the current frame only for what you asked.'
+                        : 'Answering from your question and opening notebook help when useful.'
                       : assistantState === 'replying'
-                        ? 'Replying with local browser voice for lower latency.'
+                        ? 'Replying with a more natural local browser voice for lower latency.'
                         : 'Ready for the next question.'}
                 </p>
               </div>
@@ -583,4 +633,70 @@ function normalizePlacement(value: unknown): Annotation['placement'] {
   }
 
   return 'right';
+}
+
+function chooseBestVoice(voices: SpeechSynthesisVoice[]) {
+  if (voices.length === 0) {
+    return null;
+  }
+
+  const ranked = [...voices].sort((left, right) => scoreVoice(right) - scoreVoice(left));
+  return ranked[0] ?? null;
+}
+
+function scoreVoice(voice: SpeechSynthesisVoice) {
+  const name = voice.name.toLowerCase();
+  const lang = voice.lang.toLowerCase();
+  let score = 0;
+
+  if (lang.includes('en-in')) score += 6;
+  else if (lang.startsWith('en')) score += 4;
+
+  if (voice.localService) score += 2;
+  if (name.includes('natural')) score += 4;
+  if (name.includes('neural')) score += 4;
+  if (name.includes('premium')) score += 3;
+  if (name.includes('enhanced')) score += 3;
+  if (name.includes('google')) score += 2;
+  if (name.includes('microsoft')) score += 2;
+  if (name.includes('female')) score += 1;
+  if (name.includes('zira') || name.includes('aria') || name.includes('samantha') || name.includes('moira')) score += 3;
+
+  return score;
+}
+
+function humanizeForSpeech(text: string) {
+  const cleaned = text
+    .replace(/\s+/g, ' ')
+    .replace(/\bVed\b/g, 'Ved,')
+    .trim();
+
+  return cleaned
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence, index, array) => {
+      const trimmed = sentence.trim();
+
+      if (!trimmed) {
+        return null;
+      }
+
+      const energetic = /great|nice|correct|exactly|yes|perfect/i.test(trimmed);
+      const cautious = /check|careful|wrong|mistake|error|unclear/i.test(trimmed);
+      const isLast = index === array.length - 1;
+
+      return {
+        text: ensureSpeechPunctuation(trimmed, isLast),
+        rate: cautious ? 0.94 : energetic ? 1.02 : 0.98,
+        pitch: energetic ? 1.08 : cautious ? 0.96 : 1.01,
+      };
+    })
+    .filter(Boolean) as Array<{ pitch: number; rate: number; text: string }>;
+}
+
+function ensureSpeechPunctuation(sentence: string, isLast: boolean) {
+  if (/[.!?]$/.test(sentence)) {
+    return sentence;
+  }
+
+  return `${sentence}${isLast ? '.' : ','}`;
 }
